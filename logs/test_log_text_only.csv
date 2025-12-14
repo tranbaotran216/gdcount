@@ -1,0 +1,2 @@
+model_ckpt,ckpt_epoch,split,batch_size,threshold,nms_iou,loss_total,count_mae,loss_ce,loss_bbox,loss_giou,loss_query,mae,rmse
+C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\best\gdcount_epoch_011_best.pth,11,test,1,0.23,0.5,0.8817035285364679,20.965546218487393,0.24839820758924583,0.017307278164466765,0.27338446520832405,0.0,20.965546218487393,121.91818788767787
