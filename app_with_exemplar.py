@@ -1,15 +1,11 @@
-# app.py
-# Streamlit demo cho GDCount (FSC147-style): upload ảnh + prompt -> dự đoán count
-# Chạy: streamlit run app.py
-
 import os
 import re
 import time
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
 
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 import torch
 
@@ -18,14 +14,10 @@ try:
 except Exception:
     tv_nms = None
 
-# ===== Import từ project của bạn (đảm bảo đúng path/module) =====
-# Các module này đang được dùng trong train/test của bạn.
+from streamlit_drawable_canvas import st_canvas
 from models.gdcount_model import GDCountConfig, build_gdcount_model
 
 
-# =========================
-# Helpers (giống train/test)
-# =========================
 
 def sanitize_caption(p: str) -> str:
     p = "" if p is None else str(p)
@@ -40,9 +32,6 @@ def sanitize_caption(p: str) -> str:
 
 
 def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
-    """
-    scores (B,Q) = sigmoid(max_token_logit over valid tokens) hoặc sigmoid(logit) nếu 2D.
-    """
     logits = outputs["pred_logits"].float()  # (B,Q,T) hoặc (B,Q)
 
     if logits.dim() == 2:
@@ -50,8 +39,8 @@ def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
         return torch.sigmoid(logits)
 
     B, Q, T = logits.shape
-
     token_mask = outputs.get("text_mask", None)
+
     if token_mask is None:
         token_mask = torch.ones((B, T), device=logits.device, dtype=torch.bool)
     else:
@@ -92,9 +81,6 @@ def _pick_boxes_after_thresh_nms(
     threshold: float,
     nms_iou: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Trả về (boxes_xyxy_norm (K,4), scores (K,))
-    """
     scores = _scores_from_pred_logits(outputs)[0]  # (Q,)
     keep = scores > threshold
 
@@ -125,9 +111,6 @@ def draw_boxes_on_pil(
     scores: Optional[np.ndarray] = None,
     score_threshold_to_show: float = 0.0
 ) -> Image.Image:
-    """
-    Vẽ box lên ảnh (PIL). boxes là normalized xyxy.
-    """
     img = image.copy().convert("RGB")
     W, H = img.size
     dr = ImageDraw.Draw(img)
@@ -143,8 +126,7 @@ def draw_boxes_on_pil(
         if scores is not None:
             sc = float(scores[i])
             if sc >= score_threshold_to_show:
-                txt = f"{sc:.2f}"
-                dr.text((x1 + 3, y1 + 3), txt)
+                dr.text((x1 + 3, y1 + 3), f"{sc:.2f}")
 
     return img
 
@@ -167,14 +149,6 @@ def load_model_checkpoint(model_ckpt_path: str, model: torch.nn.Module, device: 
 
 
 def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
-    """
-    Chuẩn hóa kiểu FSC147 pipeline thường dùng:
-    - Input của dataset bạn đang dùng đã normalize (mean/std ImageNet) và resize 384.
-    Ở đây, mình làm theo cách an toàn:
-    - Resize về 384 (nếu ảnh không phải 384)
-    - ToTensor
-    - Normalize ImageNet
-    """
     img = img.convert("RGB")
     img = img.resize((384, 384), Image.BILINEAR)
 
@@ -182,12 +156,60 @@ def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
     arr = arr.transpose(2, 0, 1)  # (3,H,W)
     x = torch.from_numpy(arr)
 
-    # ImageNet mean/std
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     x = (x - mean) / std
 
     return x  # (3,384,384)
+
+
+def canvas_rects_to_exemplars(canvas_json: Optional[Dict[str, Any]], max_k: int = 3) -> np.ndarray:
+    """
+    Convert objects from st_canvas to xyxy pixel boxes in 384x384 space.
+    Return (K,4) float32, K<=max_k.
+    """
+    if not canvas_json:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    objs = canvas_json.get("objects", []) or []
+    rects: List[np.ndarray] = []
+
+    for o in objs:
+        # chỉ nhận rect
+        if o.get("type") != "rect":
+            continue
+
+        left = float(o.get("left", 0.0))
+        top = float(o.get("top", 0.0))
+        w = float(o.get("width", 0.0))
+        h = float(o.get("height", 0.0))
+
+        # fabric.js có thể có scaleX/scaleY
+        sx = float(o.get("scaleX", 1.0))
+        sy = float(o.get("scaleY", 1.0))
+
+        x1 = left
+        y1 = top
+        x2 = left + w * sx
+        y2 = top + h * sy
+
+        # clamp
+        x1 = max(0.0, min(383.0, x1))
+        y1 = max(0.0, min(383.0, y1))
+        x2 = max(0.0, min(383.0, x2))
+        y2 = max(0.0, min(383.0, y2))
+
+        # đảm bảo x1<x2, y1<y2
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+
+        rects.append(np.array([x1, y1, x2, y2], dtype=np.float32))
+
+    if len(rects) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    rects = rects[:max_k]  # lấy tối đa 3 theo thứ tự vẽ
+    return np.stack(rects, axis=0)
 
 
 # =========================
@@ -197,16 +219,18 @@ def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
 st.set_page_config(page_title="GDCount Streamlit", layout="wide")
 st.title("GDCount – Demo đếm theo prompt (FSC147)")
 
+if "exemplar_boxes" not in st.session_state:
+    st.session_state.exemplar_boxes = np.zeros((0, 4), dtype=np.float32)
+
 with st.sidebar:
     st.header("Cấu hình")
 
     device_choice = st.selectbox("Device", ["cuda", "cpu"], index=0)
     device = device_choice if (device_choice == "cpu" or torch.cuda.is_available()) else "cpu"
 
-    # Default path theo đúng bạn đưa
     default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
     default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\best\gdcount_epoch_011_best.pth"
+    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_026_best.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
@@ -217,13 +241,22 @@ with st.sidebar:
     threshold = st.slider("Threshold", min_value=0.0, max_value=1.0, value=0.23, step=0.01)
     nms_iou = st.slider("NMS IoU", min_value=0.0, max_value=1.0, value=0.50, step=0.01)
 
-    show_boxes = st.checkbox("Hiển thị bounding boxes (sau threshold+NMS)", value=True)
-    show_scores = st.checkbox("Hiển thị score trên box", value=False)
+    show_boxes = st.checkbox("Hiển thị bbox output (sau threshold+NMS)", value=True)
+    show_scores = st.checkbox("Hiển thị score trên bbox output", value=False)
 
     st.divider()
 
     prompt = st.text_input("Prompt", value="object")
-    run_btn = st.button("Chạy đếm", type="primary")
+    use_user_exemplars = st.checkbox("Dùng exemplars do người dùng vẽ (tối đa 3)", value=True)
+
+    colb1, colb2 = st.columns(2)
+    with colb1:
+        clear_ex = st.button("Xoá exemplars")
+    with colb2:
+        run_btn = st.button("Chạy đếm", type="primary")
+
+    if clear_ex:
+        st.session_state.exemplar_boxes = np.zeros((0, 4), dtype=np.float32)
 
 
 @st.cache_resource(show_spinner=True)
@@ -257,10 +290,35 @@ with col_left:
     up = st.file_uploader("Upload ảnh (jpg/png)", type=["jpg", "jpeg", "png"])
 
     if up is not None:
-        img = Image.open(up)
-        st.image(img, caption="Ảnh gốc",width='stretch')
+        img = Image.open(up).convert("RGB")
+        img_384 = img.resize((384, 384), Image.BILINEAR)
+
+        st.subheader("Vẽ exemplars (tối đa 3 box)")
+        st.caption("Kéo chuột để vẽ hình chữ nhật. Chỉ lấy tối đa 3 rect theo thứ tự bạn vẽ. Không bắt buộc đủ 3.")
+
+        canvas = st_canvas(
+            fill_color="rgba(0, 0, 0, 0)",
+            stroke_width=2,
+            stroke_color="#00FF00",
+            background_image=img_384,
+            update_streamlit=True,
+            height=384,
+            width=384,
+            drawing_mode="rect",
+            key="canvas_exemplars",
+        )
+
+        ex_boxes = canvas_rects_to_exemplars(canvas.json_data, max_k=3)
+        st.session_state.exemplar_boxes = ex_boxes
+
+        st.write(f"Exemplars hiện tại: **{ex_boxes.shape[0]}** / 3")
+        if ex_boxes.shape[0] > 0:
+            st.code(ex_boxes.astype(int))
+
+        st.image(img, caption="Ảnh gốc", use_container_width=True)
     else:
         img = None
+        img_384 = None
 
 with col_right:
     st.subheader("Kết quả")
@@ -289,12 +347,27 @@ with col_right:
 
             cap = sanitize_caption(prompt)
 
-            x = preprocess_image_for_model(img).unsqueeze(0)  # (1,3,384,384)
-            x = x.to(device)
+            x = preprocess_image_for_model(img).unsqueeze(0).to(device)  # (1,3,384,384)
+
+            exemplars_tensor = None
+            labels_tensor = None
+            if use_user_exemplars:
+                ex = st.session_state.exemplar_boxes
+                if ex is not None and ex.shape[0] > 0:
+                    exemplars_tensor = torch.from_numpy(ex).to(device)  # (K,4) xyxy pixel (384-space)
+                    labels_tensor = torch.zeros((ex.shape[0],), dtype=torch.long, device=device)  # phrase index 0
 
             t0 = time.time()
             with torch.no_grad():
-                outputs: Dict[str, Any] = model(x, captions=[cap])
+                if exemplars_tensor is not None:
+                    outputs: Dict[str, Any] = model(
+                        x,
+                        captions=[cap],
+                        exemplars=[exemplars_tensor],     # list per-image
+                        labels=[labels_tensor],           # list per-image
+                    )
+                else:
+                    outputs: Dict[str, Any] = model(x, captions=[cap])
             dt = (time.time() - t0) * 1000.0
 
             boxes_t, scores_t = _pick_boxes_after_thresh_nms(outputs, threshold=threshold, nms_iou=nms_iou)
@@ -308,6 +381,9 @@ with col_right:
                 f"- Inference time: `{dt:.1f} ms`"
             )
 
+            if exemplars_tensor is not None:
+                st.write(f"- User exemplars: **{int(exemplars_tensor.shape[0])}** box(es)")
+
             if show_boxes:
                 boxes_np = boxes_t.detach().cpu().numpy() if boxes_t is not None else np.zeros((0, 4), dtype=np.float32)
                 scores_np = scores_t.detach().cpu().numpy() if scores_t is not None else None
@@ -318,9 +394,8 @@ with col_right:
                     scores=scores_np if show_scores else None,
                     score_threshold_to_show=0.0,
                 )
-                st.image(vis, caption="Ảnh 384×384 + boxes (sau threshold + NMS)", width='stretch')
+                st.image(vis, caption="Ảnh 384×384 + bbox output (threshold + NMS)", use_container_width=True)
 
-            # Optional: show raw info
             with st.expander("Debug (tensors)"):
                 st.write("outputs keys:", list(outputs.keys()))
                 if "pred_boxes" in outputs:
