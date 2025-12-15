@@ -1,3 +1,4 @@
+# test.py
 import argparse
 import os
 import csv
@@ -36,8 +37,20 @@ def sanitize_caption(p: str) -> str:
     return p
 
 
-def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
-    """scores (B,Q) = sigmoid(max_token_logit over valid tokens)"""
+def _scores_from_outputs(outputs: Dict[str, Any]) -> torch.Tensor:
+    """
+    Return scores (B,Q).
+    Ưu tiên: outputs["calib_scores"] (nếu có)
+    Fallback: sigmoid(max_token_logit) từ pred_logits.
+    """
+    if "calib_scores" in outputs and isinstance(outputs["calib_scores"], torch.Tensor):
+        s = outputs["calib_scores"]
+        if s.dim() == 2:
+            return s.float()
+        # an toàn: reshape về (B,Q)
+        return s.float().view(s.shape[0], -1)
+
+    # fallback pred_logits
     logits = outputs["pred_logits"].float()  # (B,Q,T) or (B,Q)
 
     if logits.dim() == 2:
@@ -63,7 +76,7 @@ def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
             pad = torch.zeros((B, T - ids.shape[-1]), device=logits.device, dtype=ids.dtype)
             ids = torch.cat([ids, pad], dim=-1)
         ids = ids[:, :T]
-        specials = (ids == 0) | (ids == 101) | (ids == 102)
+        specials = (ids == 0) | (ids == 101) | (ids == 102)  # PAD/CLS/SEP
         token_mask = token_mask & (~specials)
 
     logits = torch.where(torch.isfinite(logits), logits, torch.full_like(logits, -1e4))
@@ -84,10 +97,10 @@ def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 
 def count_by_det_nms(outputs: Dict[str, Any], threshold: float, nms_iou: float) -> torch.Tensor:
     """
-    Return pred_count (B,) from pred_logits/pred_boxes with threshold + NMS.
-    Uses normalized xyxy (0..1), NMS still valid.
+    Return pred_count (B,) from scores/pred_boxes with threshold + NMS.
+    Uses normalized xyxy (0..1).
     """
-    scores = _scores_from_pred_logits(outputs)  # (B,Q)
+    scores = _scores_from_outputs(outputs)  # (B,Q)
     keep = scores > threshold
 
     if ("pred_boxes" not in outputs) or (tv_nms is None):
@@ -115,7 +128,7 @@ def count_by_det_nms(outputs: Dict[str, Any], threshold: float, nms_iou: float) 
 # ========================
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Test GDCount on FSC147 (split=test)")
+    parser = argparse.ArgumentParser("Test GDCount on FSC147 (split=val & test)")
 
     # ---- GroundingDINO ----
     parser.add_argument("--config", type=str, required=True)
@@ -151,13 +164,22 @@ def parse_args() -> argparse.Namespace:
         "--model-ckpt",
         type=str,
         required=True,
-        help="Checkpoint GDCount đã train (vd: .../gdcount_epoch_011_best.pth)",
+        help="Checkpoint GDCount đã train (vd: .../gdcount_epoch_013_best.pth)",
+    )
+
+    # ---- Which splits ----
+    parser.add_argument(
+        "--splits",
+        type=str,
+        nargs="+",
+        default=["val", "test"],
+        help='Danh sách split cần chạy. Mặc định: val test. Ví dụ: --splits val test',
     )
 
     # ---- Logging ----
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--log-file", type=str, default="test_log.csv")
-
+    parser.add_argument("--exp", type=str, default=None)
     return parser.parse_args()
 
 
@@ -168,7 +190,7 @@ def create_dataloader(args: argparse.Namespace, split: str) -> DataLoader:
         split=split,
         split_file=args.split_file,
         class_map_file=args.class_map,
-        img_size=None,       # ảnh đã resize sẵn 384
+        img_size=None,
         normalize=True,
         density_root=None,
     )
@@ -203,8 +225,8 @@ def build_targets(batch: Dict[str, Any], device: str):
     images = batch["images"]
     prompts = [sanitize_caption(p) for p in batch["prompts"]]
 
-    gt_counts = batch["gt_counts"].to(device)      # (B,)
-    points_list = batch["meta"]["points"]          # list[(Ni,2)]
+    gt_counts = batch["gt_counts"].to(device)
+    points_list = batch["meta"]["points"]
 
     B = images.shape[0]
     targets = []
@@ -243,11 +265,7 @@ def build_targets(batch: Dict[str, Any], device: str):
 
         labels = torch.zeros((Ni,), dtype=torch.long, device=device)
 
-        targets.append({
-            "boxes": boxes,
-            "labels": labels,
-            "count": gt_counts[i].view(()),
-        })
+        targets.append({"boxes": boxes, "labels": labels, "count": gt_counts[i].view(())})
 
         phrase = prompts[i].strip()
         if phrase.endswith("."):
@@ -272,7 +290,8 @@ def _avg_losses(loss_sums: Dict[str, float], num_samples: int) -> Dict[str, floa
     return {k: v / num_samples for k, v in loss_sums.items()}
 
 
-def evaluate(
+def evaluate_one_split(
+    split: str,
     model: torch.nn.Module,
     loader: DataLoader,
     criterion: MultiTaskLoss,
@@ -291,7 +310,7 @@ def evaluate(
     pbar = tqdm(
         enumerate(loader),
         total=len(loader),
-        desc="Test [test]",
+        desc=f"Eval [{split}]",
         ncols=120,
     )
 
@@ -317,11 +336,7 @@ def evaluate(
                 v = loss_dict.get(k, torch.tensor(0.0, device=device)).item()
                 loss_sums[k] += v * batch_size
 
-            pred_counts = count_by_det_nms(
-                outputs,
-                threshold=criterion.threshold,
-                nms_iou=args.nms_iou
-            ).to(gt_counts.dtype)
+            pred_counts = count_by_det_nms(outputs, threshold=args.threshold, nms_iou=args.nms_iou).to(gt_counts.dtype)
 
             diff = (pred_counts - gt_counts).abs()
             mae_sum += diff.sum().item()
@@ -333,10 +348,10 @@ def evaluate(
                 {
                     "L_total": f"{avg_now['loss_total']:.3f}",
                     "MAE_cnt": f"{avg_now.get('count_mae', 0.0):.3f}",
-                    "L_ce":    f"{avg_now['loss_ce']:.3f}",
-                    "L_box":   f"{avg_now['loss_bbox']:.3f}",
-                    "L_giou":  f"{avg_now['loss_giou']:.3f}",
-                    "L_q":     f"{avg_now['loss_query']:.3f}",
+                    "L_ce": f"{avg_now['loss_ce']:.3f}",
+                    "L_box": f"{avg_now['loss_bbox']:.3f}",
+                    "L_giou": f"{avg_now['loss_giou']:.3f}",
+                    "L_q": f"{avg_now['loss_query']:.3f}",
                 }
             )
 
@@ -354,11 +369,9 @@ def evaluate(
 def load_model_checkpoint(model_ckpt_path: str, model: torch.nn.Module, device: str) -> Dict[str, Any]:
     ckpt = torch.load(model_ckpt_path, map_location=device)
 
-    # support: {"model": state_dict, ...} hoặc trực tiếp state_dict
     if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
         state = ckpt["model"]
     elif isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
-        # có thể là state_dict trực tiếp
         state = ckpt
     else:
         raise ValueError(f"Unrecognized checkpoint format: {model_ckpt_path}")
@@ -376,22 +389,25 @@ def init_test_csv(log_dir: str, filename: str) -> str:
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow([
-                "model_ckpt",
-                "ckpt_epoch",
-                "split",
-                "batch_size",
-                "threshold",
-                "nms_iou",
-                "loss_total",
-                "count_mae",
-                "loss_ce",
-                "loss_bbox",
-                "loss_giou",
-                "loss_query",
-                "mae",
-                "rmse",
-            ])
+            w.writerow(
+                [
+                    "experiment_name",
+                    "model_ckpt",
+                    "ckpt_epoch",
+                    "split",
+                    "batch_size",
+                    "threshold",
+                    "nms_iou",
+                    "loss_total",
+                    "count_mae",
+                    "loss_ce",
+                    "loss_bbox",
+                    "loss_giou",
+                    "loss_query",
+                    "mae",
+                    "rmse",
+                ]
+            )
     return path
 
 
@@ -399,27 +415,31 @@ def append_test_csv(
     csv_path: str,
     args: argparse.Namespace,
     ckpt_meta: Dict[str, Any],
+    split: str,
     losses: Dict[str, float],
     metrics: Dict[str, float],
 ) -> None:
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
-        w.writerow([
-            args.model_ckpt,
-            ckpt_meta.get("epoch", ""),
-            "test",
-            args.batch_size,
-            args.threshold,
-            args.nms_iou,
-            losses.get("loss_total", 0.0),
-            losses.get("count_mae", 0.0),
-            losses.get("loss_ce", 0.0),
-            losses.get("loss_bbox", 0.0),
-            losses.get("loss_giou", 0.0),
-            losses.get("loss_query", 0.0),
-            metrics.get("mae", 0.0),
-            metrics.get("rmse", 0.0),
-        ])
+        w.writerow(
+            [
+                args.exp,
+                args.model_ckpt,
+                ckpt_meta.get("epoch", ""),
+                split,
+                args.batch_size,
+                args.threshold,
+                args.nms_iou,
+                losses.get("loss_total", 0.0),
+                losses.get("count_mae", 0.0),
+                losses.get("loss_ce", 0.0),
+                losses.get("loss_bbox", 0.0),
+                losses.get("loss_giou", 0.0),
+                losses.get("loss_query", 0.0),
+                metrics.get("mae", 0.0),
+                metrics.get("rmse", 0.0),
+            ]
+        )
 
 
 def main():
@@ -427,9 +447,6 @@ def main():
 
     device = args.device if (torch.cuda.is_available() and args.device.startswith("cuda")) else "cpu"
     print(f"Using device: {device}")
-
-    # dataloader: test split
-    test_loader = create_dataloader(args, split="test")
 
     # model + criterion
     model = create_model(args).to(device)
@@ -461,25 +478,30 @@ def main():
     ckpt_meta = load_model_checkpoint(args.model_ckpt, model, device)
     print(f"Loaded model checkpoint: {args.model_ckpt} (epoch={ckpt_meta.get('epoch', None)})")
 
-    # run test
-    test_losses, test_metrics = evaluate(
-        model=model,
-        loader=test_loader,
-        criterion=criterion,
-        device=device,
-        args=args,
-    )
-
-    print(
-        f"[TEST] loss_total={test_losses.get('loss_total',0.0):.4f} "
-        f"count_mae={test_losses.get('count_mae',0.0):.4f} "
-        f"MAE={test_metrics.get('mae',0.0):.4f} "
-        f"RMSE={test_metrics.get('rmse',0.0):.4f}"
-    )
-
-    # write logs/test_log.csv
+    # CSV
     csv_path = init_test_csv(args.log_dir, args.log_file)
-    append_test_csv(csv_path, args, ckpt_meta, test_losses, test_metrics)
+
+    # run for each split
+    for split in args.splits:
+        loader = create_dataloader(args, split=split)
+        losses, metrics = evaluate_one_split(
+            split=split,
+            model=model,
+            loader=loader,
+            criterion=criterion,
+            device=device,
+            args=args,
+        )
+
+        print(
+            f"[{split.upper()}] loss_total={losses.get('loss_total',0.0):.4f} "
+            f"count_mae={losses.get('count_mae',0.0):.4f} "
+            f"MAE={metrics.get('mae',0.0):.4f} "
+            f"RMSE={metrics.get('rmse',0.0):.4f}"
+        )
+
+        append_test_csv(csv_path, args, ckpt_meta, split, losses, metrics)
+
     print(f"Saved test log to: {csv_path}")
 
 
