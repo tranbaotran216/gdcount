@@ -4,3 +4,4 @@ data/
 debug_out/
 weights/
 checkpoints_gdcount/
+logs/

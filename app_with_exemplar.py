@@ -315,7 +315,7 @@ with col_left:
         if ex_boxes.shape[0] > 0:
             st.code(ex_boxes.astype(int))
 
-        st.image(img, caption="Ảnh gốc", use_container_width=True)
+        st.image(img, caption="Ảnh gốc", width='stretch')
     else:
         img = None
         img_384 = None
@@ -394,7 +394,7 @@ with col_right:
                     scores=scores_np if show_scores else None,
                     score_threshold_to_show=0.0,
                 )
-                st.image(vis, caption="Ảnh 384×384 + bbox output (threshold + NMS)", use_container_width=True)
+                st.image(vis, caption="Ảnh 384×384 + bbox output (threshold + NMS)",width='stretch')
 
             with st.expander("Debug (tensors)"):
                 st.write("outputs keys:", list(outputs.keys()))
