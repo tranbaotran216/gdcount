@@ -11,9 +11,10 @@ conda activate gdcount
 ```
 
 ### 1.2 Install groundingdino
+Note: the repo groundingdino in this repo is modified, u'r ok to clone the official repo groundingdino before clone this gdcount repo
 ```powershell
 cd ./groundingdino
-pip install -e .
+pip install -e . --no-build-isolation
 ```
 
 ### Run
