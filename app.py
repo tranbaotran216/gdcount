@@ -118,6 +118,66 @@ def _pick_boxes_after_thresh_nms(
     kept = tv_nms(b, s, nms_iou)
     return b[kept], s[kept]
 
+def _boxes_to_centers_norm(boxes_xyxy_norm: torch.Tensor) -> torch.Tensor:
+    """
+    boxes_xyxy_norm: (K,4) in [0,1]
+    return centers_norm: (K,2) in [0,1]
+    """
+    if boxes_xyxy_norm is None or boxes_xyxy_norm.numel() == 0:
+        return torch.zeros((0, 2), device=boxes_xyxy_norm.device if boxes_xyxy_norm is not None else "cpu")
+    x1, y1, x2, y2 = boxes_xyxy_norm.unbind(-1)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    return torch.stack([cx, cy], dim=-1).clamp(0, 1)
+
+
+def _gaussian_kernel2d(kernel_size: int, sigma: float, device: str) -> torch.Tensor:
+    """
+    return kernel: (1,1,K,K) normalized sum=1
+    """
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    k = kernel_size
+    ax = torch.arange(k, device=device) - (k // 2)
+    xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+    kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma * sigma))
+    kernel = kernel / kernel.sum().clamp_min(1e-8)
+    return kernel.view(1, 1, k, k)
+
+
+def centers_to_density_map(
+    centers_norm: torch.Tensor,
+    out_h: int = 384,
+    out_w: int = 384,
+    sigma: float = 3.0,
+    kernel_size: int = 0,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """
+    centers_norm: (K,2) normalized
+    return density: (H,W) float32
+    """
+    density = torch.zeros((1, 1, out_h, out_w), device=device, dtype=torch.float32)
+
+    if centers_norm is None or centers_norm.numel() == 0:
+        return density[0, 0]
+
+    xs = (centers_norm[:, 0] * (out_w - 1)).round().long().clamp(0, out_w - 1)
+    ys = (centers_norm[:, 1] * (out_h - 1)).round().long().clamp(0, out_h - 1)
+
+    # đặt 1 tại tâm (impulse)
+    density[0, 0, ys, xs] += 1.0
+
+    # gaussian blur
+    if sigma > 0:
+        if kernel_size <= 0:
+            kernel_size = int(max(3, round(sigma * 6)))  # ~6*sigma
+        kernel = _gaussian_kernel2d(kernel_size, sigma, device=device)
+        pad = kernel.shape[-1] // 2
+        density = torch.nn.functional.conv2d(density, kernel, padding=pad)
+
+    return density[0, 0]
+
 
 def draw_boxes_on_pil(
     image: Image.Image,
@@ -147,6 +207,33 @@ def draw_boxes_on_pil(
                 dr.text((x1 + 3, y1 + 3), txt)
 
     return img
+
+def overlay_density_on_image(
+    image_384: Image.Image,
+    density: np.ndarray,
+    alpha: float = 0.55
+) -> Image.Image:
+    """
+    image_384: PIL RGB 384x384
+    density: (384,384) float
+    """
+    img = image_384.convert("RGB")
+    dens = density.astype(np.float32)
+
+    # normalize 0..1 để hiển thị
+    dmax = float(dens.max()) if dens.size else 0.0
+    if dmax > 1e-8:
+        dens = dens / dmax
+    dens = np.clip(dens, 0.0, 1.0)
+
+    # pseudo-color đơn giản: đỏ = dens, xanh/lam thấp
+    heat = np.zeros((dens.shape[0], dens.shape[1], 3), dtype=np.uint8)
+    heat[..., 0] = (dens * 255).astype(np.uint8)          # R
+    heat[..., 1] = (dens * 120).astype(np.uint8)          # G
+    heat[..., 2] = (dens * 30).astype(np.uint8)           # B
+
+    heat_img = Image.fromarray(heat, mode="RGB")
+    return Image.blend(img, heat_img, alpha=alpha)
 
 
 def load_model_checkpoint(model_ckpt_path: str, model: torch.nn.Module, device: str) -> Dict[str, Any]:
@@ -206,7 +293,7 @@ with st.sidebar:
     # Default path theo đúng bạn đưa
     default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
     default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\best\gdcount_epoch_011_best.pth"
+    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_011_best.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
@@ -217,8 +304,15 @@ with st.sidebar:
     threshold = st.slider("Threshold", min_value=0.0, max_value=1.0, value=0.23, step=0.01)
     nms_iou = st.slider("NMS IoU", min_value=0.0, max_value=1.0, value=0.50, step=0.01)
 
-    show_boxes = st.checkbox("Hiển thị bounding boxes (sau threshold+NMS)", value=True)
-    show_scores = st.checkbox("Hiển thị score trên box", value=False)
+    show_density = st.checkbox("Hiển thị density map (từ tâm bbox)", value=True)
+
+    sigma = 3.0
+    alpha = 0.55
+    if show_density:
+        sigma = st.slider("Sigma (Gaussian blur)", min_value=0.0, max_value=10.0, value=3.0, step=0.5)
+        alpha = st.slider("Overlay alpha", min_value=0.0, max_value=1.0, value=0.55, step=0.05)
+
+    show_scores = st.checkbox("Hiển thị score trên box", value=False)  # chỉ dùng khi show_density=False
 
     st.divider()
 
@@ -308,7 +402,26 @@ with col_right:
                 f"- Inference time: `{dt:.1f} ms`"
             )
 
-            if show_boxes:
+            if show_density:
+                # centers -> density
+                centers_norm = _boxes_to_centers_norm(boxes_t)  # (K,2)
+                density_t = centers_to_density_map(
+                    centers_norm=centers_norm.to(device),
+                    out_h=384, out_w=384,
+                    sigma=float(sigma),
+                    device=device,
+                )
+                density = density_t.detach().cpu().numpy()
+
+                img_384 = img.resize((384, 384), Image.BILINEAR)
+                vis = overlay_density_on_image(img_384, density, alpha=float(alpha))
+                st.image(vis, caption="Ảnh 384×384 + density map (từ tâm bbox)", width='stretch')
+
+                with st.expander("Density map (raw)"):
+                    st.image(density / (density.max() + 1e-8), caption="density (normalized)", width='stretch')
+
+            else:
+                # hiển thị bbox như cũ
                 boxes_np = boxes_t.detach().cpu().numpy() if boxes_t is not None else np.zeros((0, 4), dtype=np.float32)
                 scores_np = scores_t.detach().cpu().numpy() if scores_t is not None else None
 
@@ -319,12 +432,3 @@ with col_right:
                     score_threshold_to_show=0.0,
                 )
                 st.image(vis, caption="Ảnh 384×384 + boxes (sau threshold + NMS)", width='stretch')
-
-            # Optional: show raw info
-            with st.expander("Debug (tensors)"):
-                st.write("outputs keys:", list(outputs.keys()))
-                if "pred_boxes" in outputs:
-                    st.write("pred_boxes shape:", tuple(outputs["pred_boxes"].shape))
-                if "pred_logits" in outputs:
-                    st.write("pred_logits shape:", tuple(outputs["pred_logits"].shape))
-                st.write("kept boxes:", int(boxes_t.shape[0]))

@@ -230,7 +230,7 @@ with st.sidebar:
 
     default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
     default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_026_best.pth"
+    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_025_best.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
