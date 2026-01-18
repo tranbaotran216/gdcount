@@ -1,9 +1,9 @@
 # GDCount
-Final project for CS331-UIT
+Seminar project for CS331-UIT
 This training is run on the GPU RTX 3060 12GB
 ## 1) Setup environment (Windows / VSCode Terminal)
 
-### 1. Create conda env từ YAML
+### 1. Create conda env from YAML
 ```powershell
 conda env create -f env.yaml
 conda activate gdcount
@@ -28,9 +28,9 @@ streamlit run app.py
 
 ---
 #Acknowledgements
-The model is built following the paper [CountGD](https://github.com/niki-amini-naieni/CountGD)
-This repository is based on the Open-GroundingDino and uses code from the [GroundingDINO repository](https://github.com/IDEA-Research/GroundingDINO.git)
-Thanks for your great work!
+The model is built following the paper [CountGD](https://github.com/niki-amini-naieni/CountGD)<br>
+This repository is based on the Open-GroundingDino and uses code from the [GroundingDINO repository](https://github.com/IDEA-Research/GroundingDINO.git)<br>
+Thanks for your great work!<br>
 @InProceedings{AminiNaieni24,
   author = "Amini-Naieni, N. and Han, T. and Zisserman, A.",
   title = "CountGD: Multi-Modal Open-World Counting",
