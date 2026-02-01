@@ -141,6 +141,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             "labels": self.loss_labels,
             "boxes": self.loss_boxes,
+            "centers": self.loss_centers,
             "cardinality": self.loss_cardinality,
         }
         assert loss in loss_map
@@ -214,6 +215,31 @@ class SetCriterion(nn.Module):
         loss_giou = loss_giou.sum() / max(num_boxes, 1)
 
         return {"loss_bbox": loss_bbox, "loss_giou": loss_giou}
+
+    def loss_centers(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        Supervise ONLY center (cx,cy) of boxes using gt_dots (points).
+        - pred_boxes: [B,Q,4] (cxcywh, normalized)
+        - targets[j]["points"]: [Nj,2] normalized (x,y) in [0,1]
+        (Bạn cần đảm bảo build targets có key "points")
+        indices: matcher output (src_idx, tgt_idx) where tgt_idx indexes targets[j]["boxes"].
+        Ở đây ta KHÔNG dùng target box, chỉ dùng target point tương ứng.
+        """
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_centers = outputs["pred_boxes"][idx][:, :2]  # (sumN,2)
+
+        # lấy points theo tgt_idx
+        tgt_points = torch.cat(
+            [t["points"][i] for t, (_, i) in zip(targets, indices)],
+            dim=0
+        )  # (sumN,2)
+
+        loss_center = F.smooth_l1_loss(src_centers, tgt_points, reduction="none")
+        loss_center = loss_center.sum() / max(num_boxes, 1)
+
+        return {"loss_center": loss_center}
+
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes, **kwargs):

@@ -282,7 +282,7 @@ def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
 # =========================
 
 st.set_page_config(page_title="GDCount Streamlit", layout="wide")
-st.title("GDCount – Demo đếm theo prompt original")
+st.title("GDCount – Demo đếm theo prompt (FSC147)")
 
 with st.sidebar:
     st.header("Cấu hình")
@@ -293,7 +293,7 @@ with st.sidebar:
     # Default path theo đúng bạn đưa
     default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
     default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_only\best"
+    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\jitter\gdcount_epoch_015.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
@@ -330,7 +330,7 @@ def load_model_cached(
 ):
     gd_cfg = GDCountConfig(
         threshold=threshold,
-        soa_level=-1,
+        soa_level=None,
         feature_dim=256,
         freeze_keywords=["backbone.0", "bert"],
     )

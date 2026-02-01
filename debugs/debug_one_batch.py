@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from datasets.fsc147_dataset import FSC147Dataset, fsc147_collate
-from models.gdcount_model import GDCountConfig, build_gdcount_model
+from models.gdcount_model_calib import GDCountConfig, build_gdcount_model
 
 
 def parse_args() -> argparse.Namespace:

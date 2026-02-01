@@ -180,6 +180,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--log-file", type=str, default="test_log.csv")
     parser.add_argument("--exp", type=str, default=None)
+    parser.add_argument("--no-soa", action="store_true", help="Tắt SOA (không dùng SmallObjectAdapter)")
+
     return parser.parse_args()
 
 
@@ -208,7 +210,7 @@ def create_dataloader(args: argparse.Namespace, split: str) -> DataLoader:
 def create_model(args: argparse.Namespace) -> torch.nn.Module:
     cfg = GDCountConfig(
         threshold=args.threshold,
-        soa_level=args.soa_level,
+        soa_level=None if args.no_soa else args.soa_level,
         feature_dim=256,
         freeze_keywords=args.freeze_keywords,
     )
@@ -242,7 +244,7 @@ def build_targets(batch: Dict[str, Any], device: str):
 
         cnt = float(gt_counts[i].item()) if Ni > 0 else 1.0
         base = (H * W / max(cnt, 1.0)) ** 0.5
-        side = max(6.0, min(40.0, 0.5 * base))
+        side = max(6.0, min(160.0, 0.5 * base))
 
         if Ni > 0:
             cx = pts[:, 0].clamp(0, W - 1)

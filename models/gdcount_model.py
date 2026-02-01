@@ -1,26 +1,24 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from groundingdino.util.misc import NestedTensor
-from groundingdino.util.inference import load_model  # dùng để load từ config + ckpt
+from groundingdino.util.inference import load_model  # load từ config + ckpt
 
 
 @dataclass
 class GDCountConfig:
     """
-    Cấu hình cơ bản cho CountGD-style:
+    CountGD-style config
     - threshold: ngưỡng hard count trên logit từng query
-    - soa_level: index feature level dùng SOA (0 là feature coarse nhất, -1 là level cuối)
+    - soa_level: index feature level dùng SOA (0..n-1 hoặc -1..), None = tắt SOA
     - feature_dim: hidden dim của GroundingDINO (thường 256)
     - freeze_keywords: các từ khoá trong tên param để freeze (backbone, BERT)
     """
-
     threshold: float = 0.0
-    soa_level: int = -1
+    soa_level: Optional[int] = -1  # None => disable SOA
     feature_dim: int = 256
     freeze_keywords: Sequence[str] = ("backbone.0", "bert")
 
@@ -44,13 +42,11 @@ class SmallObjectAdapter(nn.Module):
         self.se_fc2 = nn.Linear(hidden, in_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,C,H,W)
         residual = x
         out = self.act(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
 
-        # SE channel attention
-        b, c, h, w = out.shape
+        b, c, _, _ = out.shape
         pooled = out.mean(dim=(2, 3))  # (B,C)
         w_se = self.act(self.se_fc1(pooled))
         w_se = torch.sigmoid(self.se_fc2(w_se)).view(b, c, 1, 1)
@@ -73,20 +69,25 @@ class SOABackboneWrapper(nn.Module):
     ) -> None:
         super().__init__()
         self.backbone = backbone  # Joiner
-        self.level_index = level_index
-        # sẽ auto-adapt lại kênh nếu cần trong forward
+        self.level_index = int(level_index)
         self.soa = SmallObjectAdapter(in_channels)
 
     def __getitem__(self, idx):
         return self.backbone[idx]
-    
+
     def __len__(self):
         try:
             return len(self.backbone)
         except Exception:
             return 0
-        
-        
+
+    def __getattr__(self, name: str):
+        # proxy mọi attribute không có ở wrapper sang backbone gốc
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.backbone, name)
+
     def forward(
         self, samples: NestedTensor
     ) -> Tuple[List[NestedTensor], List[torch.Tensor]]:
@@ -98,15 +99,14 @@ class SOABackboneWrapper(nn.Module):
         if idx < 0:
             idx = len(features) + idx
         if idx < 0 or idx >= len(features):
-            # không chèn được, trả về như cũ
             return features, pos
 
         feat_nt: NestedTensor = features[idx]
         src, mask = feat_nt.decompose()  # src: (B,C,H,W)
 
-        # nếu số kênh không khớp với SOA hiện tại, khởi tạo lại
+        # nếu số kênh không khớp, khởi tạo lại SOA đúng kênh
         C = src.shape[1]
-        if self.soa.conv1.in_channels != C:
+        if getattr(self.soa.conv1, "in_channels", None) != C:
             self.soa = SmallObjectAdapter(C).to(src.device)
 
         src = self.soa(src)
@@ -124,9 +124,16 @@ class TransformerWrapper(nn.Module):
         self.transformer = transformer
         self.last_hs = None
 
+    def __getattr__(self, name: str):
+        # proxy attribute sang transformer gốc (tránh thiếu field)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.transformer, name)
+
     def forward(self, *args, **kwargs):
         outputs = self.transformer(*args, **kwargs)
-        # Theo code GroundingDINO: hs là output[0]
+        # GroundingDINO thường trả tuple, hs ở outputs[0]
         if isinstance(outputs, tuple) and len(outputs) > 0:
             self.last_hs = outputs[0]
         else:
@@ -143,17 +150,15 @@ class CountHead(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, 1)
-        self.threshold = threshold
-
+        self.threshold = float(threshold)
 
     def forward(self, hs):
         """
         hs :
           - Tensor [num_layers, B, Q, D]
           - Tensor [B, Q, D]
-          - List[Tensor[B, Q, D]] (một số bản GroundingDINO trả kiểu list)
+          - List[Tensor[B, Q, D]]
         """
-        # Nếu là list/tuple các tensor -> stack lại
         if isinstance(hs, (list, tuple)):
             if len(hs) == 0 or not isinstance(hs[0], torch.Tensor):
                 raise ValueError(f"Unexpected hs list: {type(hs)}, first={type(hs[0]) if hs else None}")
@@ -164,67 +169,74 @@ class CountHead(nn.Module):
         elif hs.dim() == 3:
             hs_last = hs
         else:
-            raise ValueError(f"Unexpected hs shape: {hs.shape}")
+            raise ValueError(f"Unexpected hs shape: {tuple(hs.shape)}")
 
-        hs_last = self.norm(hs_last)           # (B,Q,D)
-        logits = self.fc(hs_last).squeeze(-1)  # (B,Q)
-        soft = torch.relu(logits).sum(dim=1)   # (B,)
-        hard = (logits > self.threshold).sum(dim=1).to(torch.int64)  # (B,)
+        hs_last = self.norm(hs_last)
+        logits = self.fc(hs_last).squeeze(-1)     # (B,Q)
+
+        soft = torch.relu(logits).sum(dim=1)      # (B,)
+        hard = (logits > self.threshold).sum(dim=1).to(torch.int64)
         return logits, soft, hard
 
 
 class GroundingDINOCounter(nn.Module):
     """
-    Wrapper chính: GroundingDINO + SOA + CountHead.
+    Wrapper chính: GroundingDINO (+ optional SOA) + CountHead.
     """
 
     def __init__(self, base_model: nn.Module, cfg: GDCountConfig) -> None:
         super().__init__()
         self.base_model = base_model
 
-        # 1) Lấy đúng số kênh của feature level dùng SOA
-        try:
-            num_channels_list = self.base_model.backbone.num_channels
-            lvl = cfg.soa_level
-            if lvl < 0:
-                lvl = len(num_channels_list) + lvl
-            lvl = max(0, min(lvl, len(num_channels_list) - 1))
-            in_channels = num_channels_list[lvl]
-        except Exception:
+        # 1) Optional SOA: chỉ wrap backbone nếu cfg.soa_level != None
+        if cfg.soa_level is not None:
+            # lấy số kênh đúng level nếu có
             in_channels = cfg.feature_dim
+            try:
+                num_channels_list = self.base_model.backbone.num_channels
+                lvl = int(cfg.soa_level)
+                if lvl < 0:
+                    lvl = len(num_channels_list) + lvl
+                lvl = max(0, min(lvl, len(num_channels_list) - 1))
+                in_channels = int(num_channels_list[lvl])
+            except Exception:
+                in_channels = cfg.feature_dim
 
-        # 2) Bọc backbone bằng SOABackboneWrapper
-        self.base_model.backbone = SOABackboneWrapper(
-            backbone=self.base_model.backbone,
-            level_index=cfg.soa_level,
-            in_channels=in_channels,
-        )
+            self.base_model.backbone = SOABackboneWrapper(
+                backbone=self.base_model.backbone,
+                level_index=int(cfg.soa_level),
+                in_channels=in_channels,
+            )
 
-        # 3) Bọc transformer để lấy hs
+        # 2) Bọc transformer để lấy hs
         self.base_model.transformer = TransformerWrapper(self.base_model.transformer)
 
-        # 4) Tạo count head
+        # 3) Count head
         hidden_dim = getattr(self.base_model, "hidden_dim", cfg.feature_dim)
-        self.count_head = CountHead(hidden_dim, threshold=cfg.threshold)
+        self.count_head = CountHead(int(hidden_dim), threshold=cfg.threshold)
 
-        # 5) Freeze image encoder + text encoder theo keyword
+        # 4) Freeze theo keyword
         self._apply_freeze(cfg)
 
     def _apply_freeze(self, cfg: GDCountConfig) -> None:
-        # Mặc định cho phép gradient
+        # reset: cho phép gradient
         for _, p in self.base_model.named_parameters():
             p.requires_grad = True
 
-        # Freeze theo keyword (ví dụ "backbone.0", "bert")
+        # freeze theo keyword
         for name, p in self.base_model.named_parameters():
             if any(kw in name for kw in cfg.freeze_keywords):
                 p.requires_grad = False
 
-        # Đảm bảo SOA + CountHead luôn trainable
-        for p in self.base_model.backbone.soa.parameters():
-            p.requires_grad = True
+        # đảm bảo CountHead luôn trainable
         for p in self.count_head.parameters():
             p.requires_grad = True
+
+        # nếu có SOA thì luôn trainable
+        bb = getattr(self.base_model, "backbone", None)
+        if bb is not None and hasattr(bb, "soa") and (bb.soa is not None):
+            for p in bb.soa.parameters():
+                p.requires_grad = True
 
     def forward(
         self,
@@ -235,14 +247,7 @@ class GroundingDINOCounter(nn.Module):
         labels: Any = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """
-        images: (B,3,H,W)
-        captions: list[str] length B
-        exemplars: thường là list[Tensor(K,4)] xyxy pixel (roi_align style) hoặc tùy base_model
-        labels: list/tensor label phrase index per image (vd [tensor([0]), ...])
-        """
-
-        # 1) gọi base_model có/không exemplar
+        # 1) forward base_model (có/không exemplar)
         try:
             if exemplars is not None and labels is not None:
                 outputs: Dict[str, Any] = self.base_model(
@@ -261,7 +266,6 @@ class GroundingDINOCounter(nn.Module):
                     **kwargs,
                 )
         except TypeError:
-            # fallback cho trường hợp base_model.forward không có tham số exemplars/labels
             outputs: Dict[str, Any] = self.base_model(
                 images,
                 captions=captions,
@@ -274,18 +278,17 @@ class GroundingDINOCounter(nn.Module):
         if hs is None:
             raise RuntimeError("TransformerWrapper không capture được hs (decoder output).")
 
-        # 3) count head
+        # 3) CountHead
         query_logits, soft_counts, hard_counts = self.count_head(hs)
         outputs["query_logits"] = query_logits
         outputs["soft_counts"] = soft_counts
         outputs["hard_counts"] = hard_counts
 
-        # 4) meta text
+        # 4) meta text (giữ tương thích code cũ)
         outputs["caption"] = captions
         outputs["text"] = [[p.strip() for p in cap.split(".") if p.strip()] for cap in captions]
 
         return outputs
-
 
 
 def build_gdcount_model(
@@ -302,13 +305,8 @@ def build_gdcount_model(
         model_checkpoint_path=checkpoint_path,
         device=device,
     )
-    # load_model đặt model.eval(), ta chuyển lại sang train()
     base.train()
 
     model = GroundingDINOCounter(base_model=base, cfg=gdcount_cfg)
     model.to(device)
-    # print("Has tokenizer:", hasattr(model.base_model, "tokenizer"))
-    # print("Base model type:", type(model.base_model))
-    # print("Attrs:", [k for k in dir(model.base_model) if "token" in k.lower()])
-
     return model

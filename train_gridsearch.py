@@ -1,12 +1,10 @@
-# finetune_bert.py
 import argparse
 import os
 import csv
-import re
 from typing import Any, Dict, List, Tuple
+import re
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -16,31 +14,24 @@ try:
 except Exception:
     tv_nms = None
 
-# Dataset
 from datasets.fsc147_dataset import FSC147Dataset, fsc147_collate
-
-# Model
-from models.gdcount_model_calib import GDCountConfig, build_gdcount_model
-
-# Loss / Criterion
+from models.gdcount_model import GDCountConfig, build_gdcount_model
 from scripts.losses import MultiTaskLoss
 from scripts.criterion_detect import build_criterion_detect
 
 
-# ========================
-#  EXEMPLAR INPUTS
-# ========================
+# =========================
+# Helpers
+# =========================
+
 def build_exemplar_inputs(batch: Dict[str, Any], device: str):
-    # meta["exemplar_xyxy"] : list[Tensor(K,4)] (pixel xyxy)
     ex_list = [t.to(device) for t in batch["meta"]["exemplar_xyxy"]]
-    # labels per exemplar: all zeros (single phrase)
-    labels_list = [torch.zeros((ex.shape[0],), dtype=torch.long, device=device) for ex in ex_list]
+    labels_list = [
+        torch.zeros((ex.shape[0],), dtype=torch.long, device=device) for ex in ex_list
+    ]
     return ex_list, labels_list
 
 
-# ========================
-#  TEXT HELPERS
-# ========================
 def sanitize_caption(p: str) -> str:
     p = "" if p is None else str(p)
     p = p.strip()
@@ -53,9 +44,6 @@ def sanitize_caption(p: str) -> str:
     return p
 
 
-# ========================
-#  COUNTING BY DET + NMS
-# ========================
 def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
     """scores (B,Q) = sigmoid(max_token_logit over valid tokens)"""
     logits = outputs["pred_logits"].float()  # (B,Q,T) or (B,Q)
@@ -65,6 +53,7 @@ def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
         return torch.sigmoid(logits)
 
     B, Q, T = logits.shape
+
     token_mask = outputs.get("text_mask", None)
     if token_mask is None:
         token_mask = torch.ones((B, T), device=logits.device, dtype=torch.bool)
@@ -82,11 +71,12 @@ def _scores_from_pred_logits(outputs: Dict[str, Any]) -> torch.Tensor:
             pad = torch.zeros((B, T - ids.shape[-1]), device=logits.device, dtype=ids.dtype)
             ids = torch.cat([ids, pad], dim=-1)
         ids = ids[:, :T]
-        specials = (ids == 0) | (ids == 101) | (ids == 102)  # PAD/CLS/SEP
+        specials = (ids == 0) | (ids == 101) | (ids == 102)
         token_mask = token_mask & (~specials)
 
     logits = torch.where(torch.isfinite(logits), logits, torch.full_like(logits, -1e4))
     logits = logits.masked_fill(~token_mask[:, None, :], -1e4)
+
     per_q = logits.max(dim=-1).values  # (B,Q)
     return torch.sigmoid(per_q)
 
@@ -102,16 +92,11 @@ def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 
 def count_by_det_nms(outputs: Dict[str, Any], threshold: float, nms_iou: float) -> torch.Tensor:
     """
-    Return pred_count (B,) from scores + pred_boxes with threshold + NMS.
-    Ưu tiên dùng outputs["calib_scores"] (nếu có), fallback pred_logits.
-    boxes dùng normalized xyxy (0..1).
+    Return pred_count (B,) from pred_logits/pred_boxes with threshold + NMS.
+    Uses normalized xyxy (0..1).
     """
-    if "calib_scores" in outputs and isinstance(outputs["calib_scores"], torch.Tensor):
-        scores = outputs["calib_scores"].float()  # (B,Q)
-    else:
-        scores = _scores_from_pred_logits(outputs)  # (B,Q)
-
-    keep = scores > float(threshold)
+    scores = _scores_from_pred_logits(outputs)  # (B,Q)
+    keep = scores > threshold
 
     if ("pred_boxes" not in outputs) or (tv_nms is None):
         return keep.sum(dim=1).to(torch.float32)
@@ -128,16 +113,32 @@ def count_by_det_nms(outputs: Dict[str, Any], threshold: float, nms_iou: float) 
             continue
         b_boxes = boxes_xyxy[b, idx]
         b_scores = scores[b, idx]
-        kept = tv_nms(b_boxes, b_scores, float(nms_iou))
+        kept = tv_nms(b_boxes, b_scores, nms_iou)
         out_counts.append(torch.tensor(float(kept.numel()), device=scores.device))
     return torch.stack(out_counts, dim=0)
 
 
+def make_threshold_list(thr_min: float, thr_max: float, thr_step: float) -> List[float]:
+    thr_step = max(float(thr_step), 1e-6)
+    thr_min = float(thr_min)
+    thr_max = float(thr_max)
+    if thr_max < thr_min:
+        thr_min, thr_max = thr_max, thr_min
+    out = []
+    t = thr_min
+    # tránh lỗi float
+    while t <= thr_max + 1e-9:
+        out.append(round(float(t), 6))
+        t += thr_step
+    return out
+
+
 # ========================
-#  ARGUMENTS
+#  ARGS
 # ========================
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Fine-tune BERT last layers for GDCount on FSC147")
+    parser = argparse.ArgumentParser("Train GDCount on FSC147 (CountGD-style)")
 
     # ---- GroundingDINO ----
     parser.add_argument("--config", type=str, required=True)
@@ -152,34 +153,35 @@ def parse_args() -> argparse.Namespace:
     # ---- Train ----
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-5, help="LR cho head params (không phải BERT)")
-    parser.add_argument("--bert-lr", type=float, default=2e-6, help="LR cho BERT last layers")
-    parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--save-dir", type=str, default="checkpoints_gdcount")
     parser.add_argument("--nms-iou", type=float, default=0.5)
-    parser.add_argument("--amp", action="store_true", default=False, help="Bật AMP")
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--use-exemplar", action="store_true")
+    parser.add_argument("--exp-name", type=str, default="")
 
-    parser.add_argument("--use-exemplar", action="store_true", help="Train text+exemplar")
-    parser.add_argument("--exp-name", type=str, default="", help="Tên experiment để tách log/ckpt")
+    # ---- Threshold used for "normal" val metric (not grid search) ----
+    parser.add_argument("--threshold", type=float, default=0.23)
 
     # ---- GDCount config ----
-    parser.add_argument("--threshold", type=float, default=0.23)
     parser.add_argument("--soa-level", type=int, default=-1)
     parser.add_argument("--freeze-keywords", type=str, nargs="+", default=["backbone.0", "bert"])
-
-    # Fine-tune BERT
-    parser.add_argument("--unfreeze-bert-last-n", type=int, default=2, help="Mở lại n layer cuối BERT (bert-base: tối đa 12)")
-
-    # Resume
-    parser.add_argument("--resume", type=str, default="", help="Path checkpoint để resume")
-    parser.add_argument("--start-epoch", type=int, default=-1, help="Override start epoch (>=1)")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--start-epoch", type=int, default=-1)
     parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--no-soa", action="store_true")
 
-    # LR schedule (optional)
-    parser.add_argument("--lr-step", type=int, default=10, help="StepLR step_size")
-    parser.add_argument("--lr-gamma", type=float, default=0.5, help="StepLR gamma")
+    # ---- Grid search threshold on VAL ----
+    parser.add_argument("--tune-threshold", action="store_true", help="Grid-search threshold trên VAL")
+    parser.add_argument("--thr-min", type=float, default=0.05)
+    parser.add_argument("--thr-max", type=float, default=0.60)
+    parser.add_argument("--thr-step", type=float, default=0.01)
+    parser.add_argument("--thr-metric", type=str, default="mae", choices=["mae", "rmse"], help="Chọn best_thr theo MAE hoặc RMSE")
+    parser.add_argument("--apply-best-thr", action="store_true", default=False,
+                        help="Nếu bật: cập nhật args.threshold/criterion.threshold = best_thr sau khi tune (chỉ ảnh hưởng metric)")
 
     return parser.parse_args()
 
@@ -209,14 +211,13 @@ def create_dataloader(args: argparse.Namespace, split: str) -> DataLoader:
 # ========================
 #  MODEL + OPTIMIZER
 # ========================
+
 def create_model(args: argparse.Namespace) -> torch.nn.Module:
     cfg = GDCountConfig(
         threshold=args.threshold,
-        soa_level=args.soa_level,
+        soa_level=None if args.no_soa else args.soa_level,
         feature_dim=256,
         freeze_keywords=args.freeze_keywords,
-        unfreeze_bert_last_n=int(args.unfreeze_bert_last_n),
-        use_exemplar_mod=True,
     )
     model = build_gdcount_model(
         config_path=args.config,
@@ -227,48 +228,32 @@ def create_model(args: argparse.Namespace) -> torch.nn.Module:
     return model
 
 
-def create_optimizer(model: torch.nn.Module, head_lr: float, bert_lr: float, weight_decay: float):
-    """
-    Param groups:
-      - BERT last layers: bert_lr
-      - Others trainable: head_lr
-    """
+def create_optimizer(model: torch.nn.Module, lr: float, weight_decay: float):
     head_params = []
-    bert_params = []
+    base_params = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # match bert-base encoder layers
-        if ".bert.encoder.layer." in name:
-            # chỉ muốn last layers -> đã được requires_grad=True trong gdcount_model._apply_freeze
-            bert_params.append(p)
-        else:
+        if "count_head" in name or "soa" in name:
             head_params.append(p)
+        else:
+            base_params.append(p)
 
-    # Nếu vì config mà bert_params rỗng thì vẫn OK
-    param_groups = []
-    if len(head_params) > 0:
-        param_groups.append({"params": head_params, "lr": float(head_lr)})
-    if len(bert_params) > 0:
-        param_groups.append({"params": bert_params, "lr": float(bert_lr)})
-
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=float(weight_decay))
-    return optimizer
-
-
-def create_scheduler(optimizer: torch.optim.Optimizer, step_size: int, gamma: float):
-    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(step_size), gamma=float(gamma))
+    param_groups = [
+        {"params": head_params, "lr": lr},
+        {"params": base_params, "lr": lr * 0.5},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20], gamma=0.1)
+    return optimizer, scheduler
 
 
-# ========================
-#  TARGETS
-# ========================
 def build_targets(batch: Dict[str, Any], device: str):
     images = batch["images"]
     prompts = [sanitize_caption(p) for p in batch["prompts"]]
 
-    gt_counts = batch["gt_counts"].to(device)      # (B,)
-    points_list = batch["meta"]["points"]          # list[(Ni,2)]
+    gt_counts = batch["gt_counts"].to(device)
+    points_list = batch["meta"]["points"]
 
     B = images.shape[0]
     targets = []
@@ -306,7 +291,12 @@ def build_targets(batch: Dict[str, Any], device: str):
             boxes = torch.zeros((0, 4), device=device)
 
         labels = torch.zeros((Ni,), dtype=torch.long, device=device)
-        targets.append({"boxes": boxes, "labels": labels, "count": gt_counts[i].view(())})
+
+        targets.append({
+            "boxes": boxes,
+            "labels": labels,
+            "count": gt_counts[i].view(()),
+        })
 
         phrase = prompts[i].strip()
         if phrase.endswith("."):
@@ -321,15 +311,8 @@ def build_targets(batch: Dict[str, Any], device: str):
 # ========================
 #  TRAIN / EVAL
 # ========================
-LOSS_KEYS = [
-    "loss_total",
-    "count_mae",
-    "loss_ce",
-    "loss_bbox",
-    "loss_giou",
-    "loss_query",
-    "loss_calib",
-]
+
+LOSS_KEYS = ["loss_total", "count_mae", "loss_ce", "loss_bbox", "loss_giou", "loss_query"]
 
 
 def _init_loss_sums() -> Dict[str, float]:
@@ -354,7 +337,6 @@ def train_one_epoch(
     args: argparse.Namespace,
 ) -> Dict[str, float]:
     model.train()
-
     loss_sums = _init_loss_sums()
     num_samples = 0
 
@@ -366,38 +348,28 @@ def train_one_epoch(
         images = batch["images"].to(device)
         prompts = [sanitize_caption(x) for x in batch["prompts"]]
 
-        with autocast(enabled=(args.amp and str(device).startswith("cuda"))):
+        with autocast(enabled=(args.amp and device.startswith("cuda"))):
             if args.use_exemplar:
                 exemplars, labels = build_exemplar_inputs(batch, device)
                 has_any = any(ex.shape[0] > 0 for ex in exemplars)
                 if has_any:
                     outputs: Dict[str, Any] = model(images, captions=prompts, exemplars=exemplars, labels=labels)
                 else:
-                    outputs = model(images, captions=prompts)
+                    outputs: Dict[str, Any] = model(images, captions=prompts)
             else:
-                outputs = model(images, captions=prompts)
+                outputs: Dict[str, Any] = model(images, captions=prompts)
 
-            # tránh nhầm với MultiTaskLoss fallback hard_counts
             outputs.pop("hard_counts", None)
-            outputs["img_hw"] = (images.shape[-2], images.shape[-1])
 
-            batch2 = dict(batch)
-            batch2["prompts"] = prompts
-            targets, captions, cat_list = build_targets(batch2, device=device)
-
+            batch = dict(batch)
+            batch["prompts"] = prompts
+            targets, captions, cat_list = build_targets(batch, device=device)
             loss_dict = criterion(outputs, targets, caption=captions, cat_list=cat_list)
+
             loss = loss_dict["loss_total"]
             loss_to_backprop = loss / accum_steps
 
         scaler.scale(loss_to_backprop).backward()
-
-        if step == 0:
-            ok = False
-            for _, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    ok = True
-                    break
-            print("Has gradients on trainable params:", ok)
 
         do_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(loader))
         if do_step:
@@ -414,16 +386,14 @@ def train_one_epoch(
             loss_sums[k] += v * batch_size
 
         avg_now = _avg_losses(loss_sums, num_samples)
-        pbar.set_postfix(
-            {
-                "L_total": f"{avg_now['loss_total']:.3f}",
-                "MAE_cnt": f"{avg_now.get('count_mae', 0.0):.3f}",
-                "L_ce": f"{avg_now['loss_ce']:.3f}",
-                "L_box": f"{avg_now['loss_bbox']:.3f}",
-                "L_giou": f"{avg_now['loss_giou']:.3f}",
-                "L_cal": f"{avg_now.get('loss_calib', 0.0):.3f}",
-            }
-        )
+        pbar.set_postfix({
+            "L_total": f"{avg_now['loss_total']:.3f}",
+            "MAE_cnt": f"{avg_now.get('count_mae', 0.0):.3f}",
+            "L_ce":    f"{avg_now['loss_ce']:.3f}",
+            "L_box":   f"{avg_now['loss_bbox']:.3f}",
+            "L_giou":  f"{avg_now['loss_giou']:.3f}",
+            "L_q":     f"{avg_now['loss_query']:.3f}",
+        })
 
         if (step + 1) % log_interval == 0:
             print(
@@ -433,7 +403,7 @@ def train_one_epoch(
                 f"L_ce={avg_now['loss_ce']:.4f} "
                 f"L_box={avg_now['loss_bbox']:.4f} "
                 f"L_giou={avg_now['loss_giou']:.4f} "
-                f"L_cal={avg_now.get('loss_calib', 0.0):.4f}"
+                f"L_q={avg_now['loss_query']:.4f}"
             )
 
     return _avg_losses(loss_sums, num_samples)
@@ -446,9 +416,12 @@ def evaluate(
     criterion: MultiTaskLoss,
     device: str,
     args: argparse.Namespace,
+    metric_threshold: float,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Val loss theo criterion, val MAE/RMSE theo count_by_det_nms với metric_threshold.
+    """
     model.eval()
-
     loss_sums = _init_loss_sums()
     num_samples = 0
 
@@ -456,10 +429,10 @@ def evaluate(
     mse_sum = 0.0
     n_count_samples = 0
 
-    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch} [val]  ", ncols=120)
+    pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch} [val]", ncols=120)
 
     with torch.no_grad():
-        for step, batch in pbar:
+        for _, batch in pbar:
             images = batch["images"].to(device)
             prompts = [sanitize_caption(x) for x in batch["prompts"]]
             gt_counts = batch["gt_counts"].to(device)
@@ -467,61 +440,126 @@ def evaluate(
             batch_size = images.shape[0]
             num_samples += batch_size
 
-            with autocast(enabled=(args.amp and str(device).startswith("cuda"))):
+            with autocast(enabled=(args.amp and device.startswith("cuda"))):
                 if args.use_exemplar:
                     exemplars, labels = build_exemplar_inputs(batch, device)
                     has_any = any(ex.shape[0] > 0 for ex in exemplars)
                     if has_any:
                         outputs: Dict[str, Any] = model(images, captions=prompts, exemplars=exemplars, labels=labels)
                     else:
-                        outputs = model(images, captions=prompts)
+                        outputs: Dict[str, Any] = model(images, captions=prompts)
                 else:
-                    outputs = model(images, captions=prompts)
+                    outputs: Dict[str, Any] = model(images, captions=prompts)
 
                 outputs.pop("hard_counts", None)
-                outputs["img_hw"] = (images.shape[-2], images.shape[-1])
 
-                batch2 = dict(batch)
-                batch2["prompts"] = prompts
-                targets, captions, cat_list = build_targets(batch2, device)
+                batch = dict(batch)
+                batch["prompts"] = prompts
+                targets, captions, cat_list = build_targets(batch, device)
                 loss_dict = criterion(outputs, targets, caption=captions, cat_list=cat_list)
 
             for k in LOSS_KEYS:
                 v = loss_dict.get(k, torch.tensor(0.0, device=device)).item()
                 loss_sums[k] += v * batch_size
 
-            pred_counts = count_by_det_nms(outputs, threshold=criterion.threshold, nms_iou=args.nms_iou).to(gt_counts.dtype)
+            pred_counts = count_by_det_nms(outputs, threshold=metric_threshold, nms_iou=args.nms_iou).to(gt_counts.dtype)
+
             diff = (pred_counts - gt_counts).abs()
             mae_sum += diff.sum().item()
             mse_sum += (diff ** 2).sum().item()
             n_count_samples += gt_counts.numel()
 
             avg_now = _avg_losses(loss_sums, num_samples)
-            pbar.set_postfix(
-                {
-                    "L_total": f"{avg_now['loss_total']:.3f}",
-                    "MAE_cnt": f"{avg_now.get('count_mae', 0.0):.3f}",
-                    "L_ce": f"{avg_now['loss_ce']:.3f}",
-                    "L_box": f"{avg_now['loss_bbox']:.3f}",
-                    "L_giou": f"{avg_now['loss_giou']:.3f}",
-                    "L_cal": f"{avg_now.get('loss_calib', 0.0):.3f}",
-                }
-            )
+            pbar.set_postfix({
+                "L_total": f"{avg_now['loss_total']:.3f}",
+                "MAE_cnt": f"{avg_now.get('count_mae', 0.0):.3f}",
+                "L_ce":    f"{avg_now['loss_ce']:.3f}",
+                "L_box":   f"{avg_now['loss_bbox']:.3f}",
+                "L_giou":  f"{avg_now['loss_giou']:.3f}",
+                "L_q":     f"{avg_now['loss_query']:.3f}",
+            })
 
     avg_losses = _avg_losses(loss_sums, num_samples)
     if n_count_samples > 0:
         mae = mae_sum / n_count_samples
         rmse = (mse_sum / n_count_samples) ** 0.5
     else:
-        mae = 0.0
-        rmse = 0.0
-
+        mae, rmse = 0.0, 0.0
     return avg_losses, {"mae": mae, "rmse": rmse}
 
 
+def tune_threshold_on_val(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """
+    Grid-search threshold trên VAL, forward mỗi batch 1 lần, thử nhiều threshold bằng hậu xử lý.
+    Return: best_thr + best_mae/rmse + (tuỳ chọn) bảng kết quả.
+    """
+    model.eval()
+    thr_list = make_threshold_list(args.thr_min, args.thr_max, args.thr_step)
+    if len(thr_list) == 0:
+        return {"best_thr": args.threshold, "best_mae": None, "best_rmse": None, "table": {}}
+
+    mae_sum = {thr: 0.0 for thr in thr_list}
+    mse_sum = {thr: 0.0 for thr in thr_list}
+    n = 0
+
+    with torch.no_grad():
+        for _, batch in tqdm(enumerate(loader), total=len(loader), desc="Tune threshold [val]", ncols=120):
+            images = batch["images"].to(device)
+            prompts = [sanitize_caption(x) for x in batch["prompts"]]
+            gt_counts = batch["gt_counts"].to(device)
+
+            with autocast(enabled=(args.amp and device.startswith("cuda"))):
+                if args.use_exemplar:
+                    exemplars, labels = build_exemplar_inputs(batch, device)
+                    has_any = any(ex.shape[0] > 0 for ex in exemplars)
+                    if has_any:
+                        outputs: Dict[str, Any] = model(images, captions=prompts, exemplars=exemplars, labels=labels)
+                    else:
+                        outputs: Dict[str, Any] = model(images, captions=prompts)
+                else:
+                    outputs: Dict[str, Any] = model(images, captions=prompts)
+
+                outputs.pop("hard_counts", None)
+
+            for thr in thr_list:
+                pred_counts = count_by_det_nms(outputs, threshold=thr, nms_iou=args.nms_iou).to(gt_counts.dtype)
+                diff = (pred_counts - gt_counts).abs()
+                mae_sum[thr] += diff.sum().item()
+                mse_sum[thr] += (diff ** 2).sum().item()
+
+            n += gt_counts.numel()
+
+    table = {}
+    best_thr = thr_list[0]
+    best_key = float("inf")
+
+    for thr in thr_list:
+        mae = mae_sum[thr] / max(n, 1)
+        rmse = (mse_sum[thr] / max(n, 1)) ** 0.5
+        table[thr] = {"mae": mae, "rmse": rmse}
+
+        key = mae if args.thr_metric == "mae" else rmse
+        if key < best_key:
+            best_key = key
+            best_thr = thr
+
+    return {
+        "best_thr": best_thr,
+        "best_mae": table[best_thr]["mae"],
+        "best_rmse": table[best_thr]["rmse"],
+        "table": table,
+    }
+
+
 # ========================
-#  CHECKPOINT + LOG CSV
+#  CHECKPOINT + CSV
 # ========================
+
 def save_checkpoint(
     epoch: int,
     model: torch.nn.Module,
@@ -530,6 +568,7 @@ def save_checkpoint(
     scaler: GradScaler,
     save_dir: str,
     suffix: str = "",
+    extra: Dict[str, Any] = None,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     if suffix:
@@ -541,9 +580,12 @@ def save_checkpoint(
         "epoch": epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "scaler": scaler.state_dict() if scaler is not None else None,
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
     }
+    if extra:
+        state.update(extra)
+
     torch.save(state, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}")
     return ckpt_path
@@ -556,43 +598,33 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     scaler: GradScaler,
     device: str,
-    load_optim: bool = False,   # NEW
 ) -> int:
     ckpt = torch.load(ckpt_path, map_location=device)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-    print(f"[CKPT] Missing keys: {len(missing)}")
-    if len(missing) > 0:
-        print("  - missing (first 20):", missing[:20])
-    print(f"[CKPT] Unexpected keys: {len(unexpected)}")
-    if len(unexpected) > 0:
-        print("  - unexpected (first 20):", unexpected[:20])
+    model.load_state_dict(ckpt["model"], strict=True)
 
-    if load_optim:
-        if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt and ckpt["scheduler"] is not None and scheduler is not None:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        if "scaler" in ckpt and ckpt["scaler"] is not None and scaler is not None:
-            scaler.load_state_dict(ckpt["scaler"])
+    if "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
 
     return int(ckpt.get("epoch", 0)) + 1
 
 
-
-def init_csv_logger(log_dir: str = "logs", filename: str = "train_log.csv") -> str:
+def init_csv_logger(log_dir: str, filename: str) -> str:
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, filename)
     if not os.path.exists(path):
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "epoch",
-                    "train_loss_total", "train_count_mae", "train_loss_ce", "train_loss_bbox", "train_loss_giou", "train_loss_query", "train_loss_calib",
-                    "val_loss_total", "val_count_mae", "val_loss_ce", "val_loss_bbox", "val_loss_giou", "val_loss_query", "val_loss_calib",
-                    "val_mae", "val_rmse",
-                ]
-            )
+            writer.writerow([
+                "epoch",
+                "train_loss_total","train_count_mae","train_loss_ce","train_loss_bbox","train_loss_giou","train_loss_query",
+                "val_loss_total","val_count_mae","val_loss_ce","val_loss_bbox","val_loss_giou","val_loss_query",
+                "val_mae","val_rmse",
+                "best_thr","best_thr_mae","best_thr_rmse",
+            ])
     return path
 
 
@@ -602,60 +634,58 @@ def append_csv_log(
     train_losses: Dict[str, float],
     val_losses: Dict[str, float],
     val_metrics: Dict[str, float],
+    best_thr: float = None,
+    best_thr_mae: float = None,
+    best_thr_rmse: float = None,
 ) -> None:
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                epoch,
-                train_losses.get("loss_total", 0.0),
-                train_losses.get("count_mae", 0.0),
-                train_losses.get("loss_ce", 0.0),
-                train_losses.get("loss_bbox", 0.0),
-                train_losses.get("loss_giou", 0.0),
-                train_losses.get("loss_query", 0.0),
-                train_losses.get("loss_calib", 0.0),
+        writer.writerow([
+            epoch,
+            train_losses.get("loss_total",0.0),
+            train_losses.get("count_mae", 0.0),
+            train_losses.get("loss_ce",0.0),
+            train_losses.get("loss_bbox",0.0),
+            train_losses.get("loss_giou",0.0),
+            train_losses.get("loss_query",0.0),
 
-                val_losses.get("loss_total", 0.0),
-                val_losses.get("count_mae", 0.0),
-                val_losses.get("loss_ce", 0.0),
-                val_losses.get("loss_bbox", 0.0),
-                val_losses.get("loss_giou", 0.0),
-                val_losses.get("loss_query", 0.0),
-                val_losses.get("loss_calib", 0.0),
+            val_losses.get("loss_total",0.0),
+            val_losses.get("count_mae", 0.0),
+            val_losses.get("loss_ce",0.0),
+            val_losses.get("loss_bbox",0.0),
+            val_losses.get("loss_giou",0.0),
+            val_losses.get("loss_query",0.0),
 
-                val_metrics.get("mae", 0.0),
-                val_metrics.get("rmse", 0.0),
-            ]
-        )
+            val_metrics.get("mae",0.0),
+            val_metrics.get("rmse",0.0),
+
+            "" if best_thr is None else best_thr,
+            "" if best_thr_mae is None else best_thr_mae,
+            "" if best_thr_rmse is None else best_thr_rmse,
+        ])
 
 
 # ========================
 #  MAIN
 # ========================
+
 def main():
     args = parse_args()
-
     exp = args.exp_name.strip()
     if not exp:
-        exp = "finetune_bert_exemplar" if args.use_exemplar else "finetune_bert_text"
+        exp = "text_exemplar" if args.use_exemplar else "text_only"
 
     device = args.device if (torch.cuda.is_available() and args.device.startswith("cuda")) else "cpu"
     print(f"Using device: {device}")
 
-    # Data
     train_loader = create_dataloader(args, split="train")
     val_loader = create_dataloader(args, split="val")
 
-    # Model
-    model = create_model(args)
-    model.to(device)
-
-    trainable = sum(1 for p in model.parameters() if p.requires_grad)
+    model = create_model(args).to(device)
+    trainable = sum(p.requires_grad for p in model.parameters())
     total = sum(1 for _ in model.parameters())
     print(f"Trainable params: {trainable}/{total}")
 
-    # Criterion detect
     criterion_detect = build_criterion_detect(
         tokenizer=model.base_model.tokenizer,
         num_classes=1,
@@ -667,7 +697,6 @@ def main():
         lambda_giou=2.0,
     )
 
-    # MultiTaskLoss: bật calib loss để train calibrator
     criterion = MultiTaskLoss(
         criterion=criterion_detect,
         weight_dict=criterion_detect.weight_dict,
@@ -675,41 +704,27 @@ def main():
         use_query_loss=False,
         log_count_mae=True,
         threshold=args.threshold,
-        nms_iou=args.nms_iou,
-        lambda_calib=1.0,
-        use_calib_loss=True,
     )
+    criterion.nms_iou = args.nms_iou
 
-    # Optimizer + Scheduler + Scaler
-    optimizer = create_optimizer(model, args.lr, args.bert_lr, args.weight_decay)
-    scheduler = create_scheduler(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
+    optimizer, scheduler = create_optimizer(model, args.lr, args.weight_decay)
     scaler = GradScaler(enabled=(args.amp and device.startswith("cuda")))
 
-    # CSV logger
+    save_dir = os.path.join(args.save_dir, exp)
     csv_path = init_csv_logger(log_dir="logs", filename=f"train_log_{exp}.csv")
 
     best_val = float("inf")
-    start_epoch = 1
 
+    start_epoch = 1
     if args.resume:
         if not os.path.isfile(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
-        start_epoch = load_checkpoint(
-            args.resume,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            device=device,
-            load_optim=False,
-        )
+        start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler, scaler, device)
 
     if args.start_epoch is not None and args.start_epoch > 0:
         start_epoch = args.start_epoch
 
     print(f"Start epoch: {start_epoch}")
-
-    save_dir = os.path.join(args.save_dir, exp)
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_losses = train_one_epoch(
@@ -724,6 +739,7 @@ def main():
             args=args,
         )
 
+        # ---- VAL (metric theo args.threshold hiện tại) ----
         val_losses, val_metrics = evaluate(
             epoch=epoch,
             model=model,
@@ -731,7 +747,30 @@ def main():
             criterion=criterion,
             device=device,
             args=args,
+            metric_threshold=float(args.threshold),
         )
+
+        best_thr = None
+        best_thr_mae = None
+        best_thr_rmse = None
+
+        # ---- GRID SEARCH THRESHOLD ON VAL ----
+        if args.tune_threshold:
+            tune = tune_threshold_on_val(model, val_loader, device, args)
+            best_thr = float(tune["best_thr"])
+            best_thr_mae = float(tune["best_mae"])
+            best_thr_rmse = float(tune["best_rmse"])
+
+            print(
+                f"[TuneThr@VAL] metric={args.thr_metric} "
+                f"best_thr={best_thr:.3f} best_MAE={best_thr_mae:.4f} best_RMSE={best_thr_rmse:.4f}"
+            )
+
+            if args.apply_best_thr:
+                args.threshold = best_thr
+                criterion.threshold = best_thr
+                # nếu muốn val_metrics hiển thị đúng best_thr luôn:
+                val_metrics = {"mae": best_thr_mae, "rmse": best_thr_rmse}
 
         print(
             f"Epoch {epoch}/{args.epochs} "
@@ -740,22 +779,53 @@ def main():
             f"ce={train_losses.get('loss_ce',0.0):.4f}, "
             f"bbox={train_losses.get('loss_bbox',0.0):.4f}, "
             f"giou={train_losses.get('loss_giou',0.0):.4f}, "
-            f"calib={train_losses.get('loss_calib',0.0):.4f} "
+            f"q={train_losses.get('loss_query',0.0):.4f} "
             f"| Val: total={val_losses.get('loss_total',0.0):.4f}, "
             f"count_mae={val_losses.get('count_mae',0.0):.4f}, "
             f"MAE={val_metrics.get('mae',0.0):.4f}, "
-            f"RMSE={val_metrics.get('rmse',0.0):.4f}"
+            f"RMSE={val_metrics.get('rmse',0.0):.4f} "
+            f"(thr={float(args.threshold):.3f})"
         )
 
-        append_csv_log(csv_path, epoch, train_losses, val_losses, val_metrics)
+        # CSV
+        append_csv_log(
+            csv_path,
+            epoch,
+            train_losses,
+            val_losses,
+            val_metrics,
+            best_thr=best_thr,
+            best_thr_mae=best_thr_mae,
+            best_thr_rmse=best_thr_rmse,
+        )
 
         scheduler.step()
 
-        save_checkpoint(epoch, model, optimizer, scheduler, scaler, save_dir)
+        # save ckpt
+        save_checkpoint(epoch, model, optimizer, scheduler, scaler, save_dir, extra={
+            "args_threshold": float(args.threshold),
+            "best_thr_val": best_thr,
+            "best_thr_val_mae": best_thr_mae,
+            "best_thr_val_rmse": best_thr_rmse,
+        })
 
-        if val_losses.get("loss_total", 1e9) < best_val:
+        if val_losses["loss_total"] < best_val:
             best_val = val_losses["loss_total"]
-            save_checkpoint(epoch, model, optimizer, scheduler, scaler, os.path.join(save_dir, "best"), suffix="best")
+            save_checkpoint(
+                epoch,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                os.path.join(save_dir, "best"),
+                suffix="best",
+                extra={
+                    "args_threshold": float(args.threshold),
+                    "best_thr_val": best_thr,
+                    "best_thr_val_mae": best_thr_mae,
+                    "best_thr_val_rmse": best_thr_rmse,
+                }
+            )
 
 
 if __name__ == "__main__":

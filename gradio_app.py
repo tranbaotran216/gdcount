@@ -1,15 +1,15 @@
-# app.py
-# Streamlit demo cho GDCount (FSC147-style): upload ảnh + prompt -> dự đoán count
-# Chạy: streamlit run app.py
+# app_gradio.py
+# Gradio demo cho GDCount (FSC147-style): upload ảnh + prompt -> dự đoán count
+# Chạy: python app_gradio.py
 
 import os
 import re
 import time
 from typing import Any, Dict, Tuple, Optional
 
-import streamlit as st
+import gradio as gr
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 import torch
 
@@ -18,8 +18,6 @@ try:
 except Exception:
     tv_nms = None
 
-# ===== Import từ project của bạn (đảm bảo đúng path/module) =====
-# Các module này đang được dùng trong train/test của bạn.
 from models.gdcount_model import GDCountConfig, build_gdcount_model
 
 
@@ -118,6 +116,7 @@ def _pick_boxes_after_thresh_nms(
     kept = tv_nms(b, s, nms_iou)
     return b[kept], s[kept]
 
+
 def _boxes_to_centers_norm(boxes_xyxy_norm: torch.Tensor) -> torch.Tensor:
     """
     boxes_xyxy_norm: (K,4) in [0,1]
@@ -165,13 +164,11 @@ def centers_to_density_map(
     xs = (centers_norm[:, 0] * (out_w - 1)).round().long().clamp(0, out_w - 1)
     ys = (centers_norm[:, 1] * (out_h - 1)).round().long().clamp(0, out_h - 1)
 
-    # đặt 1 tại tâm (impulse)
     density[0, 0, ys, xs] += 1.0
 
-    # gaussian blur
     if sigma > 0:
         if kernel_size <= 0:
-            kernel_size = int(max(3, round(sigma * 6)))  # ~6*sigma
+            kernel_size = int(max(3, round(sigma * 6)))
         kernel = _gaussian_kernel2d(kernel_size, sigma, device=device)
         pad = kernel.shape[-1] // 2
         density = torch.nn.functional.conv2d(density, kernel, padding=pad)
@@ -203,10 +200,10 @@ def draw_boxes_on_pil(
         if scores is not None:
             sc = float(scores[i])
             if sc >= score_threshold_to_show:
-                txt = f"{sc:.2f}"
-                dr.text((x1 + 3, y1 + 3), txt)
+                dr.text((x1 + 3, y1 + 3), f"{sc:.2f}")
 
     return img
+
 
 def overlay_density_on_image(
     image_384: Image.Image,
@@ -220,20 +217,18 @@ def overlay_density_on_image(
     img = image_384.convert("RGB")
     dens = density.astype(np.float32)
 
-    # normalize 0..1 để hiển thị
     dmax = float(dens.max()) if dens.size else 0.0
     if dmax > 1e-8:
         dens = dens / dmax
     dens = np.clip(dens, 0.0, 1.0)
 
-    # pseudo-color đơn giản: đỏ = dens, xanh/lam thấp
     heat = np.zeros((dens.shape[0], dens.shape[1], 3), dtype=np.uint8)
-    heat[..., 0] = (dens * 255).astype(np.uint8)          # R
-    heat[..., 1] = (dens * 120).astype(np.uint8)          # G
-    heat[..., 2] = (dens * 30).astype(np.uint8)           # B
+    heat[..., 0] = (dens * 255).astype(np.uint8)
+    heat[..., 1] = (dens * 120).astype(np.uint8)
+    heat[..., 2] = (dens * 30).astype(np.uint8)
 
     heat_img = Image.fromarray(heat, mode="RGB")
-    return Image.blend(img, heat_img, alpha=alpha)
+    return Image.blend(img, heat_img, alpha=float(alpha))
 
 
 def load_model_checkpoint(model_ckpt_path: str, model: torch.nn.Module, device: str) -> Dict[str, Any]:
@@ -254,22 +249,13 @@ def load_model_checkpoint(model_ckpt_path: str, model: torch.nn.Module, device: 
 
 
 def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
-    """
-    Chuẩn hóa kiểu FSC147 pipeline thường dùng:
-    - Input của dataset bạn đang dùng đã normalize (mean/std ImageNet) và resize 384.
-    Ở đây, mình làm theo cách an toàn:
-    - Resize về 384 (nếu ảnh không phải 384)
-    - ToTensor
-    - Normalize ImageNet
-    """
     img = img.convert("RGB")
     img = img.resize((384, 384), Image.BILINEAR)
 
-    arr = np.asarray(img).astype(np.float32) / 255.0  # (H,W,3)
-    arr = arr.transpose(2, 0, 1)  # (3,H,W)
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)
     x = torch.from_numpy(arr)
 
-    # ImageNet mean/std
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
     x = (x - mean) / std
@@ -278,58 +264,30 @@ def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
 
 
 # =========================
-# Streamlit UI
+# Model cache (Gradio)
 # =========================
 
-st.set_page_config(page_title="GDCount Streamlit", layout="wide")
-st.title("GDCount – Demo đếm theo prompt original")
+_MODEL_CACHE: Dict[Tuple[str, str, str, str, float], Tuple[torch.nn.Module, Dict[str, Any]]] = {}
 
-with st.sidebar:
-    st.header("Cấu hình")
-
-    device_choice = st.selectbox("Device", ["cuda", "cpu"], index=0)
-    device = device_choice if (device_choice == "cpu" or torch.cuda.is_available()) else "cpu"
-
-    # Default path theo đúng bạn đưa
-    default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
-    default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_only\best"
-
-    config_path = st.text_input("GroundingDINO config", value=default_config)
-    gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
-    model_ckpt_path = st.text_input("GDCount trained checkpoint", value=default_model_ckpt)
-
-    st.divider()
-
-    threshold = st.slider("Threshold", min_value=0.0, max_value=1.0, value=0.23, step=0.01)
-    nms_iou = st.slider("NMS IoU", min_value=0.0, max_value=1.0, value=0.50, step=0.01)
-
-    show_density = st.checkbox("Hiển thị density map (từ tâm bbox)", value=True)
-
-    sigma = 3.0
-    alpha = 0.55
-    if show_density:
-        sigma = st.slider("Sigma (Gaussian blur)", min_value=0.0, max_value=10.0, value=3.0, step=0.5)
-        alpha = st.slider("Overlay alpha", min_value=0.0, max_value=1.0, value=0.55, step=0.05)
-
-    show_scores = st.checkbox("Hiển thị score trên box", value=False)  # chỉ dùng khi show_density=False
-
-    st.divider()
-
-    prompt = st.text_input("Prompt", value="object")
-    run_btn = st.button("Chạy đếm", type="primary")
+def get_device(device_choice: str) -> str:
+    if device_choice == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
-@st.cache_resource(show_spinner=True)
 def load_model_cached(
     config_path: str,
     gdino_ckpt_path: str,
     model_ckpt_path: str,
     device: str,
-    threshold: float
+    threshold: float,
 ):
+    key = (config_path, gdino_ckpt_path, model_ckpt_path, device, float(threshold))
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
+
     gd_cfg = GDCountConfig(
-        threshold=threshold,
+        threshold=float(threshold),
         soa_level=-1,
         feature_dim=256,
         freeze_keywords=["backbone.0", "bert"],
@@ -342,93 +300,172 @@ def load_model_cached(
     )
     meta = load_model_checkpoint(model_ckpt_path, model, device)
     model.eval()
+
+    _MODEL_CACHE[key] = (model, meta)
     return model, meta
 
 
-col_left, col_right = st.columns([1, 1])
+# =========================
+# Inference function (Gradio)
+# =========================
 
-with col_left:
-    up = st.file_uploader("Upload ảnh (jpg/png)", type=["jpg", "jpeg", "png"])
+def infer(
+    image_in,
+    prompt: str,
+    device_choice: str,
+    config_path: str,
+    gdino_ckpt_path: str,
+    model_ckpt_path: str,
+    threshold: float,
+    nms_iou: float,
+    show_density: bool,
+    sigma: float,
+    alpha: float,
+    show_scores: bool,
+):
+    if image_in is None:
+        return None, "Vui lòng upload ảnh."
 
-    if up is not None:
-        img = Image.open(up)
-        st.image(img, caption="Ảnh gốc",width='stretch')
+    device = get_device(device_choice)
+
+    # Validate paths
+    if not os.path.isfile(config_path):
+        return None, f"Không tìm thấy config: {config_path}"
+    if not os.path.isfile(gdino_ckpt_path):
+        return None, f"Không tìm thấy GroundingDINO ckpt: {gdino_ckpt_path}"
+    if not os.path.isfile(model_ckpt_path):
+        return None, f"Không tìm thấy GDCount ckpt: {model_ckpt_path}"
+
+    # image_in can be numpy or PIL depending on gradio
+    if isinstance(image_in, np.ndarray):
+        img = Image.fromarray(image_in.astype(np.uint8))
     else:
-        img = None
+        img = image_in if isinstance(image_in, Image.Image) else Image.open(image_in)
 
-with col_right:
-    st.subheader("Kết quả")
-    if img is None:
-        st.info("Upload ảnh để bắt đầu.")
-    else:
-        if run_btn:
-            if not os.path.isfile(config_path):
-                st.error(f"Không tìm thấy config: {config_path}")
-                st.stop()
-            if not os.path.isfile(gdino_ckpt_path):
-                st.error(f"Không tìm thấy GroundingDINO ckpt: {gdino_ckpt_path}")
-                st.stop()
-            if not os.path.isfile(model_ckpt_path):
-                st.error(f"Không tìm thấy GDCount ckpt: {model_ckpt_path}")
-                st.stop()
+    cap = sanitize_caption(prompt)
 
-            with st.spinner("Đang load model (lần đầu có thể lâu)..."):
-                model, meta = load_model_cached(
-                    config_path=config_path,
-                    gdino_ckpt_path=gdino_ckpt_path,
-                    model_ckpt_path=model_ckpt_path,
-                    device=device,
-                    threshold=threshold,
+    model, meta = load_model_cached(
+        config_path=config_path,
+        gdino_ckpt_path=gdino_ckpt_path,
+        model_ckpt_path=model_ckpt_path,
+        device=device,
+        threshold=float(threshold),
+    )
+
+    x = preprocess_image_for_model(img).unsqueeze(0).to(device)
+
+    t0 = time.time()
+    with torch.no_grad():
+        outputs: Dict[str, Any] = model(x, captions=[cap])
+    dt_ms = (time.time() - t0) * 1000.0
+
+    boxes_t, scores_t = _pick_boxes_after_thresh_nms(
+        outputs, threshold=float(threshold), nms_iou=float(nms_iou)
+    )
+    pred_count = int(boxes_t.shape[0]) if boxes_t is not None else 0
+
+    info = (
+        f"Predicted count: {pred_count}\n"
+        f"Prompt: {cap}\n"
+        f"Device: {device}\n"
+        f"Checkpoint epoch: {meta.get('epoch','')}\n"
+        f"Inference time: {dt_ms:.1f} ms\n"
+        f"Kept boxes: {pred_count}"
+    )
+
+    img_384 = img.convert("RGB").resize((384, 384), Image.BILINEAR)
+
+    if show_density:
+        centers_norm = _boxes_to_centers_norm(boxes_t)
+        density_t = centers_to_density_map(
+            centers_norm=centers_norm.to(device),
+            out_h=384, out_w=384,
+            sigma=float(sigma),
+            device=device,
+        )
+        density = density_t.detach().cpu().numpy()
+        vis = overlay_density_on_image(img_384, density, alpha=float(alpha))
+        return vis, info
+
+    # show bbox
+    boxes_np = boxes_t.detach().cpu().numpy() if boxes_t is not None else np.zeros((0, 4), dtype=np.float32)
+    scores_np = scores_t.detach().cpu().numpy() if scores_t is not None else None
+
+    vis = draw_boxes_on_pil(
+        image=img_384,
+        boxes_xyxy_norm=boxes_np,
+        scores=scores_np if bool(show_scores) else None,
+        score_threshold_to_show=0.0,
+    )
+    return vis, info
+
+
+# =========================
+# Gradio UI
+# =========================
+
+DEFAULT_CONFIG = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
+DEFAULT_GDINO_CKPT = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
+DEFAULT_MODEL_CKPT = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_011_best.pth"
+
+with gr.Blocks(title="GDCount – Gradio Demo") as demo:
+    gr.Markdown("# GDCount – Demo đếm theo prompt (FSC147)\nUpload ảnh + prompt → dự đoán count.")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            image_in = gr.Image(label="Upload ảnh (jpg/png)", type="pil")
+            prompt_in = gr.Textbox(label="Prompt", value="object")
+
+            with gr.Accordion("Cấu hình model", open=True):
+                device_choice = gr.Radio(
+                    choices=["cuda", "cpu"],
+                    value="cuda",
+                    label="Device"
                 )
+                config_path = gr.Textbox(label="GroundingDINO config", value=DEFAULT_CONFIG)
+                gdino_ckpt_path = gr.Textbox(label="GroundingDINO checkpoint", value=DEFAULT_GDINO_CKPT)
+                model_ckpt_path = gr.Textbox(label="GDCount trained checkpoint", value=DEFAULT_MODEL_CKPT)
 
-            cap = sanitize_caption(prompt)
+            with gr.Accordion("Inference params", open=True):
+                threshold = gr.Slider(0.0, 1.0, value=0.23, step=0.01, label="Threshold")
+                nms_iou = gr.Slider(0.0, 1.0, value=0.50, step=0.01, label="NMS IoU")
 
-            x = preprocess_image_for_model(img).unsqueeze(0)  # (1,3,384,384)
-            x = x.to(device)
+            with gr.Accordion("Hiển thị", open=True):
+                show_density = gr.Checkbox(value=True, label="Hiển thị density map (từ tâm bbox)")
+                sigma = gr.Slider(0.0, 10.0, value=3.0, step=0.5, label="Sigma (Gaussian blur)")
+                alpha = gr.Slider(0.0, 1.0, value=0.55, step=0.05, label="Overlay alpha")
+                show_scores = gr.Checkbox(value=False, label="Hiển thị score trên box (chỉ khi tắt density)")
 
-            t0 = time.time()
-            with torch.no_grad():
-                outputs: Dict[str, Any] = model(x, captions=[cap])
-            dt = (time.time() - t0) * 1000.0
+            run_btn = gr.Button("Chạy đếm", variant="primary")
 
-            boxes_t, scores_t = _pick_boxes_after_thresh_nms(outputs, threshold=threshold, nms_iou=nms_iou)
-            pred_count = int(boxes_t.shape[0]) if boxes_t is not None else 0
+        with gr.Column(scale=1):
+            out_image = gr.Image(label="Kết quả", type="pil")
+            out_text = gr.Textbox(label="Thông tin", lines=8)
 
-            st.metric("Predicted count", pred_count)
-            st.write(
-                f"- Prompt: `{cap}`\n"
-                f"- Device: `{device}`\n"
-                f"- Checkpoint epoch: `{meta.get('epoch', '')}`\n"
-                f"- Inference time: `{dt:.1f} ms`"
-            )
+    # bật/tắt sigma/alpha theo show_density
+    def _toggle_density_controls(flag: bool):
+        return gr.update(visible=flag), gr.update(visible=flag)
 
-            if show_density:
-                # centers -> density
-                centers_norm = _boxes_to_centers_norm(boxes_t)  # (K,2)
-                density_t = centers_to_density_map(
-                    centers_norm=centers_norm.to(device),
-                    out_h=384, out_w=384,
-                    sigma=float(sigma),
-                    device=device,
-                )
-                density = density_t.detach().cpu().numpy()
+    show_density.change(_toggle_density_controls, inputs=[show_density], outputs=[sigma, alpha])
 
-                img_384 = img.resize((384, 384), Image.BILINEAR)
-                vis = overlay_density_on_image(img_384, density, alpha=float(alpha))
-                st.image(vis, caption="Ảnh 384×384 + density map (từ tâm bbox)", width='stretch')
+    run_btn.click(
+        fn=infer,
+        inputs=[
+            image_in,
+            prompt_in,
+            device_choice,
+            config_path,
+            gdino_ckpt_path,
+            model_ckpt_path,
+            threshold,
+            nms_iou,
+            show_density,
+            sigma,
+            alpha,
+            show_scores,
+        ],
+        outputs=[out_image, out_text],
+    )
 
-                with st.expander("Density map (raw)"):
-                    st.image(density / (density.max() + 1e-8), caption="density (normalized)", width='stretch')
-
-            else:
-                # hiển thị bbox như cũ
-                boxes_np = boxes_t.detach().cpu().numpy() if boxes_t is not None else np.zeros((0, 4), dtype=np.float32)
-                scores_np = scores_t.detach().cpu().numpy() if scores_t is not None else None
-
-                vis = draw_boxes_on_pil(
-                    image=img.resize((384, 384), Image.BILINEAR),
-                    boxes_xyxy_norm=boxes_np,
-                    scores=scores_np if show_scores else None,
-                    score_threshold_to_show=0.0,
-                )
-                st.image(vis, caption="Ảnh 384×384 + boxes (sau threshold + NMS)", width='stretch')
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)

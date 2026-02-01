@@ -16,7 +16,7 @@ except Exception:
     tv_nms = None
 
 from datasets.fsc147_dataset import FSC147Dataset, fsc147_collate
-from models.gdcount_model import GDCountConfig, build_gdcount_model
+from models.gdcount_model_calib import GDCountConfig, build_gdcount_model
 from scripts.losses import MultiTaskLoss
 from scripts.criterion_detect import build_criterion_detect
 

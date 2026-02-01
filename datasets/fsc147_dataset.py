@@ -1,10 +1,8 @@
 import json
 import os
 from typing import List, Dict, Any, Tuple, Optional
-
 import numpy as np
 from PIL import Image
-
 import torch
 from torch.utils.data import Dataset
 
@@ -129,9 +127,12 @@ class FSC147Dataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         w, h = img.size
 
-        # Nếu bạn muốn ép size (không khuyến nghị nếu folder đã resize đúng)
         if self.img_size is not None and (w != self.img_size or h != self.img_size):
             img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
+            w, h = img.size
+
+        elif max(w,h) > 384:
+            img = img.resize((384, 384), Image.BICUBIC)
             w, h = img.size
 
         arr = np.asarray(img).astype("float32") / 255.0  # (H,W,C)
@@ -142,24 +143,23 @@ class FSC147Dataset(Dataset):
             mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
             std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
             x = (x - mean) / std
+        #<class 'torch.Tensor'> torch.float32 torch.Size([3, 384, 384])
+        # <class 'tuple'> 384 384
 
         return x, (h, w)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         img_id = self.image_ids[idx]
         rec = self.ann[img_id]
-
         img_path = os.path.join(self.img_root, img_id)
         img_tensor, (img_h, img_w) = self._load_image_tensor(img_path)
 
-        # prompt: dùng class map (ưu tiên) -> "name ."
         cls_name = self.img2class.get(img_id, "")
         prompt = cls_name if cls_name else rec.get("class", "")
         prompt = (prompt.strip() if prompt else "object").strip()
         if not prompt.endswith("."):
             prompt = prompt + " ."
 
-        # ratio từ annotation (đúng với ảnh trong folder)
         ratio_w = rec.get("ratio_w", 1.0)
         ratio_h = rec.get("ratio_h", 1.0)
 
@@ -206,25 +206,67 @@ class FSC147Dataset(Dataset):
         return sample
 
 
-def fsc147_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    images = torch.stack([b["images"] for b in batch], dim=0)          # (B,3,H,W)
-    prompts = [b["prompts"] for b in batch]                            # list[str]
-    gt_counts = torch.stack([b["gt_counts"] for b in batch], dim=0)    # (B,)
+def collate_batch(batch):
+    B = len(batch)
+
+    images = torch.stack([b["images"] for b in batch], dim=0)  # (B,3,H,W)
+    prompts = [b["prompts"] for b in batch]
+    gt_counts = torch.stack([b["gt_counts"].float().view(1) for b in batch], dim=0).squeeze(1)  # (B,)
+
+    metas = [b["meta"] for b in batch]
+
+    # Variable-length: points
+    points_list = [m.get("points") for m in metas]
+    n_list = [p.shape[0] if isinstance(p, torch.Tensor) else 0 for p in points_list]
+    max_n = max(n_list) if n_list else 0
+
+    if max_n > 0:
+        points = images.new_full((B, max_n, 2), -1.0)
+        points_mask = torch.zeros((B, max_n), dtype=torch.bool)
+        for i, p in enumerate(points_list):
+            if isinstance(p, torch.Tensor) and p.numel() > 0:
+                ni = p.shape[0]
+                points[i, :ni] = p.to(points.dtype)
+                points_mask[i, :ni] = True
+    else:
+        points = images.new_empty((B, 0, 2))
+        points_mask = torch.zeros((B, 0), dtype=torch.bool)
+
+    # Variable-length: exemplar boxes
+    ex_list = [m.get("exemplar_xyxy") for m in metas]
+    m_list = [e.shape[0] if isinstance(e, torch.Tensor) else 0 for e in ex_list]
+    max_m = max(m_list) if m_list else 0
+
+    if max_m > 0:
+        exemplar_xyxy = images.new_full((B, max_m, 4), -1.0)
+        exemplar_mask = torch.zeros((B, max_m), dtype=torch.bool)
+        for i, e in enumerate(ex_list):
+            if isinstance(e, torch.Tensor) and e.numel() > 0:
+                mi = e.shape[0]
+                exemplar_xyxy[i, :mi] = e.to(exemplar_xyxy.dtype)
+                exemplar_mask[i, :mi] = True
+    else:
+        exemplar_xyxy = images.new_empty((B, 0, 4))
+        exemplar_mask = torch.zeros((B, 0), dtype=torch.bool)
 
     meta = {
-        "image_ids": [b["meta"]["image_ids"] for b in batch],
-        "class_names": [b["meta"]["class_names"] for b in batch],
-        "points": [b["meta"]["points"] for b in batch],               # list[Tensor(N,2)]
-        "exemplar_xyxy": [b["meta"]["exemplar_xyxy"] for b in batch], # list[Tensor(K,4)]
-        "img_h": [b["meta"]["img_h"] for b in batch],
-        "img_w": [b["meta"]["img_w"] for b in batch],
-        "ratio_w": [b["meta"]["ratio_w"] for b in batch],
-        "ratio_h": [b["meta"]["ratio_h"] for b in batch],
+        "image_ids":   [m.get("image_ids") for m in metas],
+        "class_names": [m.get("class_names") for m in metas],
+        "ratio_w": torch.tensor([float(m.get("ratio_w", 1.0)) for m in metas], dtype=torch.float32),
+        "ratio_h": torch.tensor([float(m.get("ratio_h", 1.0)) for m in metas], dtype=torch.float32),
+        "img_h":   torch.tensor([int(m.get("img_h", 0)) for m in metas], dtype=torch.int64),
+        "img_w":   torch.tensor([int(m.get("img_w", 0)) for m in metas], dtype=torch.int64),
+        "ann_H":   torch.tensor([int(m.get("ann_H", 0)) for m in metas], dtype=torch.int64),
+        "ann_W":   torch.tensor([int(m.get("ann_W", 0)) for m in metas], dtype=torch.int64),
     }
 
     return {
         "images": images,
         "prompts": prompts,
         "gt_counts": gt_counts,
+        "points": points,
+        "points_mask": points_mask,
+        "exemplar_xyxy": exemplar_xyxy,
+        "exemplar_mask": exemplar_mask,
         "meta": meta,
     }

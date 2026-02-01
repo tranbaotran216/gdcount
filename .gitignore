@@ -5,3 +5,15 @@ debug_out/
 weights/
 checkpoints_gdcount/
 logs/
+
+# Cache
+__pycache__/
+*.pyc
+
+# Data & Predictions
+test_prediction/
+*.jpg
+*.png
+
+# Gradio/Temp
+.gradio/

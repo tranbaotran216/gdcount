@@ -206,5 +206,5 @@ class MultiTaskLoss(nn.Module):
 
         out["loss_det"] = loss_det_total
         out["loss_query"] = loss_q
-        out["loss_total"] = loss_det_total + loss_q  # <-- CHỈ BACKPROP QUA DET + QUERY
+        out["loss_total"] = loss_det_total + loss_q  
         return out
