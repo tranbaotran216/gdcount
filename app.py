@@ -291,9 +291,9 @@ with st.sidebar:
     device = device_choice if (device_choice == "cpu" or torch.cuda.is_available()) else "cpu"
 
     # Default path theo đúng bạn đưa
-    default_config = r"C:\Users\PC\Documents\college\CV\gdcount\groundingdino\groundingdino\config\GroundingDINO_SwinT_OGC.py"
-    default_gdino_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\weights\groundingdino_swint_ogc.pth"
-    default_model_ckpt = r"C:\Users\PC\Documents\college\CV\gdcount\checkpoints_gdcount\text_exemplar\best\gdcount_epoch_011_best.pth"
+    default_config = "./weights/GroundingDINO_SwinT_OGC.py"
+    default_gdino_ckpt = "./weights/groundingdino_swint_ogc.pth"
+    default_model_ckpt = "./checkpoints/gdcount_epoch_013_best.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)
