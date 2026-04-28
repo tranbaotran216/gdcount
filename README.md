@@ -1,3 +1,9 @@
+---
+title: GDCount
+sdk: docker
+app_port: 8501
+---
+
 # GDCount
 Seminar project for CS331-UIT
 This training is run on the GPU RTX 3060 12GB

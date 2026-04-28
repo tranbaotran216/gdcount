@@ -1,0 +1,14 @@
+.git
+__pycache__
+*.pyc
+.ipynb_checkpoints
+
+datasets
+logs
+debugs
+gdcount_old
+
+weights
+checkpoints
+*.pth
+*.ckpt
