@@ -3,5 +3,17 @@
 data/
 debug_out/
 weights/
+!weights/
+!weights/**
+!weights/*.pth
+!weights/*.ckpt
+weights/groundingdino_swint_ogc.pth
+checkpoints/
+!checkpoints/
+!checkpoints/**
+!checkpoints/*.pth
+!checkpoints/*.ckpt
+checkpoints/gdcount_epoch_011_best.pth
 checkpoints_gdcount/
 logs/
+GroundingDINO/.asset/

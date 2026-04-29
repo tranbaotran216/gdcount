@@ -2,6 +2,7 @@
 title: GDCount
 sdk: docker
 app_port: 8501
+suggested_hardware: t4-medium
 ---
 
 # GDCount

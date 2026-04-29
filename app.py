@@ -293,7 +293,7 @@ with st.sidebar:
     # Default path theo đúng bạn đưa
     default_config = "./weights/GroundingDINO_SwinT_OGC.cfg.py"
     default_gdino_ckpt = "./weights/groundingdino_swint_ogc.pth"
-    default_model_ckpt = "./checkpoints/gdcount_epoch_011_best.pth"
+    default_model_ckpt = "./checkpoints/gdcount_epoch_011_best_fp16.pth"
 
     config_path = st.text_input("GroundingDINO config", value=default_config)
     gdino_ckpt_path = st.text_input("GroundingDINO checkpoint", value=default_gdino_ckpt)

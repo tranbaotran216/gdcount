@@ -6,6 +6,8 @@ ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 ENV STREAMLIT_SERVER_PORT=8501
 ENV CUDA_HOME=/usr/local/cuda
+ENV HF_HOME=/app/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/app/.cache/huggingface/transformers
 
 WORKDIR /app
 
@@ -45,7 +47,11 @@ RUN pip install --no-cache-dir \
     gitpython \
     addict
 
+RUN python -c "from transformers import AutoTokenizer, BertModel; AutoTokenizer.from_pretrained('bert-base-uncased'); BertModel.from_pretrained('bert-base-uncased')"
+
 COPY . /app
+
+RUN python -c "from huggingface_hub import hf_hub_download; import os, shutil; os.makedirs('/app/weights', exist_ok=True); p = hf_hub_download(repo_id='ShilongLiu/GroundingDINO', filename='groundingdino_swint_ogc.pth'); shutil.copyfile(p, '/app/weights/groundingdino_swint_ogc.pth')"
 
 EXPOSE 8501
 

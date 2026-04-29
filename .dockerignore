@@ -7,8 +7,5 @@ datasets
 logs
 debugs
 gdcount_old
-
-weights
-checkpoints
-*.pth
-*.ckpt
+checkpoints/gdcount_epoch_011_best.pth
+weights/groundingdino_swint_ogc.pth
