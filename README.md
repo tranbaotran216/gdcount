@@ -32,6 +32,7 @@ Every code to run can be found in the file test_gd.ipynb
 streamlit run app.py
 # or any app version 
 ```
+or trying DEMO on HF [HERE](https://huggingface.co/spaces/Phiphi216/GDCount)
 
 ---
 #Acknowledgements
