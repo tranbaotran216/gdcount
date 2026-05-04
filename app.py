@@ -282,6 +282,44 @@ def preprocess_image_for_model(img: Image.Image) -> torch.Tensor:
 # =========================
 
 st.set_page_config(page_title="GDCount Streamlit", layout="wide")
+st.markdown(
+    """
+    <style>
+    /*
+      Streamlit's image fullscreen view can oscillate when a fluid-width image
+      keeps changing its computed height. The inference outputs are square
+      384x384 images, so keep their box stable and fit the bitmap inside it.
+    */
+    div[data-testid="stImage"] {
+        contain: layout paint;
+    }
+
+    div[data-testid="stImage"] img {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        transform: translateZ(0);
+        backface-visibility: hidden;
+    }
+
+    div[data-testid="stImage"] img[alt^="Ảnh 384"],
+    div[data-testid="stImage"] img[alt^="density"] {
+        aspect-ratio: 1 / 1;
+        object-fit: contain;
+    }
+
+    div[data-testid="stFullScreenFrame"] img,
+    div[role="dialog"] img {
+        max-width: min(96vw, 96vh);
+        max-height: 96vh;
+        width: auto;
+        height: auto;
+        object-fit: contain;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("GDCount – Demo đếm theo prompt (FSC147)")
 
 with st.sidebar:
@@ -314,11 +352,6 @@ with st.sidebar:
 
     show_scores = st.checkbox("Hiển thị score trên box", value=False)  # chỉ dùng khi show_density=False
 
-    st.divider()
-
-    prompt = st.text_input("Prompt", value="object")
-    run_btn = st.button("Chạy đếm", type="primary")
-
 
 @st.cache_resource(show_spinner=True)
 def load_model_cached(
@@ -345,6 +378,13 @@ def load_model_cached(
     return model, meta
 
 
+prompt_col, run_col = st.columns([4, 1])
+with prompt_col:
+    prompt = st.text_input("Prompt", value="object")
+with run_col:
+    st.write("")
+    run_btn = st.button("Chạy đếm", type="primary", width='stretch')
+
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
@@ -358,6 +398,7 @@ with col_left:
 
 with col_right:
     st.subheader("Kết quả")
+    result_slot = st.empty()
     if img is None:
         st.info("Upload ảnh để bắt đầu.")
     else:
@@ -415,7 +456,7 @@ with col_right:
 
                 img_384 = img.resize((384, 384), Image.BILINEAR)
                 vis = overlay_density_on_image(img_384, density, alpha=float(alpha))
-                st.image(vis, caption="Ảnh 384×384 + density map (từ tâm bbox)", width='stretch')
+                result_slot.image(vis, caption="Ảnh 384×384 + density map (từ tâm bbox)", width='stretch')
 
                 with st.expander("Density map (raw)"):
                     st.image(density / (density.max() + 1e-8), caption="density (normalized)", width='stretch')
@@ -431,4 +472,4 @@ with col_right:
                     scores=scores_np if show_scores else None,
                     score_threshold_to_show=0.0,
                 )
-                st.image(vis, caption="Ảnh 384×384 + boxes (sau threshold + NMS)", width='stretch')
+                result_slot.image(vis, caption="Ảnh 384×384 + boxes (sau threshold + NMS)", width='stretch')
