@@ -24,23 +24,20 @@ In this upgraded release, the counting pipeline is augmented with a post-process
 * **The Proposed Enhancement:**
   - Integrates an explicit binary **Presence Gate**: $\hat{z} \in \{0, 1\}$.
   - Constructs a query-conditioned candidate *Seed Pool* and enforces sequential consistency ($\tau_c = 0.70$).
-  - If the target concept is absent or fails to establish a consistent visual seed pool, all candidate proposals are suppressed, rigorously enforcing:
-    $$P(\hat{C} = 0 \mid \text{Target Absent}) = 1$$
+  - If the target concept is absent or fails to establish a consistent visual seed pool, all candidate proposals are suppressed, rigorously enforcing: $P(\hat{C} = 0 \mid \text{Target Absent}) = 1$.
 
 ### 2. Multi-Object Co-Presence Disambiguation
 * **The Failure Mode:** In cluttered real-world scenes displaying multiple object categories simultaneously (e.g., a table with *apples*, *oranges*, and *bottles*), baseline counters frequently misidentify visually similar distractors and over-count cross-category objects.
 * **The Proposed Enhancement:**
   - Employs an offline-indexed **Competitor Feature Bank** spanning 147 FSC-147 categories.
-  - Implements competitive argmax class attribution:
-    $$c^* = \arg\max_{c \in \mathcal{C}} \text{Sim}(v_i, c)$$
+  - Implements competitive argmax class attribution: $c^* = \arg\max_{c \in \mathcal{C}} \text{Sim}(v_i, c)$.
   - Candidates whose visual representations align more strongly with an alternative co-present category ($c^* \neq q$) are pruned as distractors.
 
 ### 3. Pure Post-Processing Image-Adaptive Prototype ($p_{\text{adapt}}$)
 The enhancement operates strictly at inference time as a modular post-processor, requiring no retraining of the detector backbone:
 1. Extract L2-normalized ROI visual embeddings $v_i \in \mathbb{R}^D$ from candidate proposals using dense foundation features.
 2. Dynamically aggregate high-confidence *trusted seeds* within the test image into an image-specific **Real Prototype ($p_{\text{real}}$)** that captures scene-level illumination, scale, and perspective.
-3. Blend $p_{\text{real}}$ with the canonical synthetic prototype $p_{\text{syn}}^*$ ($\lambda = 0.20$):
-   $$p_{\text{adapt}} = \text{normalize}\left((1 - \lambda) p_{\text{real}} + \lambda p_{\text{syn}}^*\right)$$
+3. Blend $p_{\text{real}}$ with the canonical synthetic prototype $p_{\text{syn}}^{*}$ ($\lambda = 0.20$): $p_{\text{adapt}} = \text{normalize}\left((1 - \lambda) p_{\text{real}} + \lambda p_{\text{syn}}^{*}\right)$.
 4. Filter out candidates failing the adapted cosine similarity threshold: $s_{\text{adapt}, i} = v_i^T p_{\text{adapt}} \ge \tau_{\text{adapt}} = 0.60$.
 
 ```mermaid
@@ -80,14 +77,14 @@ Traditional Few-Shot Object Counting (e.g., FSC-147 baselines) requires users to
 
 To bridge this gap without human intervention:
 1. **Diffusion-Based Exemplar Generation:** We use a high-capacity diffusion model (**FLUX.1 [dev]**) to synthesize canonical visual exemplar images for all 147 vocabulary categories (`syn_FSC147_classes`).
-2. **Canonical Prototype Extraction:** For each synthetic image, standard exemplar bounding boxes are extracted and encoded into normalized canonical prototype vectors ($p_{\text{syn}}^*$) stored in the prototype bank.
+2. **Canonical Prototype Extraction:** For each synthetic image, standard exemplar bounding boxes are extracted and encoded into normalized canonical prototype vectors ($p_{\text{syn}}^{*}$) stored in the prototype bank.
 
 ### The Synthetic-to-Real Domain Gap
 While synthetic exemplars provide clean, studio-lit representations of canonical shapes:
 * Synthetic images often exhibit uniform backgrounds, ideal lighting, and isolated viewpoints.
 * Real-world test images contain complex textures, shadows, occlusions, perspective distortion, and domain shift.
 
-Directly matching real test proposals against static synthetic prototypes can cause severe under-counting. The **Image-Adaptive Prototype Refinement** solves this by dynamically creating an in-image prototype ($p_{\text{real}}$) from the highest-confidence instances found in the test image itself, then lightly anchoring it to the synthetic canon ($p_{\text{syn}}^*$). This eliminates the domain gap entirely at zero additional training cost.
+Directly matching real test proposals against static synthetic prototypes can cause severe under-counting. The **Image-Adaptive Prototype Refinement** solves this by dynamically creating an in-image prototype ($p_{\text{real}}$) from the highest-confidence instances found in the test image itself, then lightly anchoring it to the synthetic canon ($p_{\text{syn}}^{*}$). This eliminates the domain gap entirely at zero additional training cost.
 
 ---
 
