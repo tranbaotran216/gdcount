@@ -17,3 +17,6 @@ checkpoints/gdcount_epoch_011_best.pth
 checkpoints_gdcount/
 logs/
 GroundingDINO/.asset/
+
+__pycache__/
+*.pyc
