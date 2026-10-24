@@ -179,4 +179,3 @@ This project builds upon the foundational research and codebases of:
 * [CountGD](https://github.com/niki-amini-naieni/CountGD) (NeurIPS 2024 - Amini-Naieni et al.)
 * [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO.git) (IDEA-Research)
 * DINOv3 (Meta AI Research)
-* Research on Object-Presence Hallucination (OPH) & the PrACo Benchmark (Tran, Ninh, Dung - UIT VNU-HCM, 2026).
