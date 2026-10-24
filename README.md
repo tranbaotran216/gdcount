@@ -8,7 +8,6 @@ suggested_hardware: t4-medium
 # GDCount + Exp3: Image-Adaptive Anti-Hallucination Zero-Shot Counting
 
 > **Seminar Project CS331 - Computer Vision (UIT VNU-HCM)**  
-> **Tác giả:** Trần Bảo Trâm (`tranbaotran216`), Lê Hoàng Ninh, GVHD: Mai Tiến Dũng  
 > **Môi trường thực nghiệm:** Huấn luyện trên GPU NVIDIA RTX 3060 12GB  
 > **Checkpoint khuyến nghị:** `gdcount_epoch_013_best.pth` (Calibrated Model)
 
